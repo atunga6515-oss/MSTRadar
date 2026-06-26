@@ -40,7 +40,7 @@ source venv/bin/activate && python bot.py
 ## 4. systemd servislerini kur
 
 `deploy/` içindeki iki dosyada **User** ve **yolları kendine göre düzelt**
-(varsayılan `alper` / `/home/alper/btc_etf_bot`). Sonra:
+(`YOUR_USER` → gerçek kullanıcı adın, yolu da kendi yolunla). Sonra:
 
 ```bash
 sudo cp deploy/btc-bot.service /etc/systemd/system/
