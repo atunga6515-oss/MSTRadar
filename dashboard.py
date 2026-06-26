@@ -18,7 +18,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, us_market_status, csv_list,
-                  alpaca_latest_prices)
+                  alpaca_latest_prices, fetch_klines, normalize_ohlc, mtf_score,
+                  forecast_cone, empirical_up_probability)
 
 try:
     import yfinance as yf
@@ -67,6 +68,74 @@ def live_prices(symbols):
     return px
 
 
+# --- Coklu zaman dilimi (MTF) veri toplayicilari ---
+MTF_LABELS = ["Saatlik", "12 Saat", "Gunluk", "Haftalik"]
+MTF_WEIGHTS = [1.5, 1.3, 1.0, 0.7]  # 6 saatlik ufuk: yakin dilimler daha agirlikli
+
+
+@st.cache_data(ttl=300)
+def mtf_btc():
+    """BTC icin 4 zaman dilimi (Binance, anahtar gerekmez)."""
+    intervals = {"Saatlik": "1h", "12 Saat": "12h", "Gunluk": "1d", "Haftalik": "1w"}
+    out = {}
+    for label, iv in intervals.items():
+        df = fetch_klines("BTCUSDT", iv, 300)
+        if not df.empty:
+            out[label] = mtf_score(df)
+    return out
+
+
+@st.cache_data(ttl=600)
+def mtf_equity(symbol):
+    """MSTR/ETF icin 4 zaman dilimi (yfinance). Intraday seans disi bosluklu olabilir."""
+    out = {}
+    if not HAS_YF:
+        return out
+    try:
+        h1 = normalize_ohlc(yf.Ticker(symbol).history(period="60d", interval="1h"))
+        if not h1.empty:
+            out["Saatlik"] = mtf_score(h1)
+            h12 = h1.set_index("timestamp_dt").resample("12h").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ).dropna().reset_index()
+            if len(h12) >= 55:
+                out["12 Saat"] = mtf_score(h12)
+        d1 = normalize_ohlc(yf.Ticker(symbol).history(period="2y", interval="1d"))
+        if not d1.empty:
+            out["Gunluk"] = mtf_score(d1)
+        w1 = normalize_ohlc(yf.Ticker(symbol).history(period="5y", interval="1wk"))
+        if not w1.empty:
+            out["Haftalik"] = mtf_score(w1)
+    except Exception:
+        pass
+    return out
+
+
+def confluence(scores: dict):
+    """Zaman dilimi skorlarini agirlikli birlestir -> (genel skor, etiket)."""
+    num = den = 0.0
+    for lbl, w in zip(MTF_LABELS, MTF_WEIGHTS):
+        if lbl in scores and scores[lbl][1] != "VERI YOK":
+            num += scores[lbl][0] * w
+            den += w
+    if den == 0:
+        return None, "VERI YOK"
+    s = num / den
+    lab = ("GUCLU YUKARI" if s >= 35 else "YUKARI" if s >= 12 else
+           "GUCLU ASAGI" if s <= -35 else "ASAGI" if s <= -12 else "NOTR / KARARSIZ")
+    return round(s, 1), lab
+
+
+def dir_emoji(label: str) -> str:
+    if "YUKARI" in label:
+        return "🟢 ↑"
+    if "ASAGI" in label:
+        return "🔴 ↓"
+    if label == "VERI YOK":
+        return "⚪ –"
+    return "🟡 →"
+
+
 def fmt_ts(ms):
     if not ms or pd.isna(ms):
         return "-"
@@ -93,7 +162,8 @@ if top[4].button("🔄 Yenile"):
     st.cache_data.clear()
     st.rerun()
 
-tabs = st.tabs(["📊 Grafikler", "🔔 Sinyaller & Pozisyonlar", "📈 Performans", "⚙️ Yonetim"])
+tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller & Pozisyonlar",
+                "📈 Performans", "⚙️ Yonetim"])
 
 # ===========================================================================
 # TAB 1 — Grafikler
@@ -166,9 +236,80 @@ with tabs[0]:
                 pass
 
 # ===========================================================================
-# TAB 2 — Sinyaller & Pozisyonlar
+# TAB 1b — Tahmin / Coklu Zaman Dilimi (MTF)
 # ===========================================================================
 with tabs[1]:
+    st.subheader("🔮 Çoklu Zaman Dilimi Eğilim Analizi")
+    st.caption("Her varlık için Saatlik / 12 Saat / Günlük / Haftalık dilimlerde yön + güç. "
+               "Bu bir kesin tahmin DEĞİL; mevcut kurulumun eğilimini özetler.")
+
+    underlying = settings.s("UNDERLYING") or "MSTR"
+    assets = ["BTC", underlying] + settings.list("ASSETS_BULL") + settings.list("ASSETS_BEAR")
+
+    rows = []
+    btc_conf = None
+    for a in assets:
+        scores = mtf_btc() if a == "BTC" else mtf_equity(a)
+        cs, clabel = confluence(scores)
+        if a == "BTC":
+            btc_conf = cs
+        row = {"Varlık": a}
+        for lbl in MTF_LABELS:
+            if lbl in scores:
+                sc, slabel, _ = scores[lbl]
+                row[lbl] = f"{dir_emoji(slabel)} {sc:+.0f}"
+            else:
+                row[lbl] = "⚪ –"
+        row["GENEL"] = f"{dir_emoji(clabel)} {clabel}" + (f" ({cs:+.0f})" if cs is not None else "")
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("🟢↑ yukarı · 🔴↓ aşağı · 🟡→ nötr/kararsız · ⚪– veri yok. "
+               "Sayı = o dilimin yön skoru (−100…+100). GENEL = ağırlıklı birleşim "
+               "(6 saatlik ufuk için yakın dilimler daha ağırlıklı).")
+
+    st.divider()
+    st.subheader("📈 BTC — 6 Saatlik Olasılık Konisi")
+    df5 = load_candles(2000)
+    if df5.empty or len(df5) < 300:
+        st.info("Koni için yeterli 5dk veri yok (worker biraz daha çalışsın).")
+    else:
+        drift = (btc_conf / 100.0) if btc_conf is not None else 0.0
+        cone = forecast_cone(df5, horizon_hours=6, bar_minutes=5, drift_bias=drift)
+        prob, nsample = empirical_up_probability(df5, horizon_bars=72)
+
+        mc = st.columns(3)
+        mc[0].metric("Genel eğilim (BTC)", f"{btc_conf:+.0f}" if btc_conf is not None else "–")
+        mc[1].metric("6s yukarı olasılığı*", f"%{prob:.0f}" if prob is not None else "yetersiz veri",
+                     help="Geçmişte benzer trend+momentum rejiminde fiyatın 6 saatte yukarı kapama oranı.")
+        mc[2].metric("Beklenen oynaklık (±1σ, 6s)", f"%{cone.get('sigma_6h_pct', 0):.1f}" if cone else "–")
+
+        if cone:
+            hist = df5.tail(72)  # son 6 saat
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist['timestamp_dt'], y=hist['close'], name="BTC (gerçek)",
+                                     line=dict(color="#2962FF", width=2)))
+            t = cone['times']
+            fig.add_trace(go.Scatter(x=t, y=cone['upper2'], line=dict(width=0), showlegend=False,
+                                     hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=t, y=cone['lower2'], fill='tonexty', name="±2σ aralık",
+                                     fillcolor="rgba(41,98,255,0.08)", line=dict(width=0), hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=t, y=cone['upper1'], line=dict(width=0), showlegend=False,
+                                     hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=t, y=cone['lower1'], fill='tonexty', name="±1σ aralık",
+                                     fillcolor="rgba(41,98,255,0.18)", line=dict(width=0), hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=t, y=cone['median'], name="Eğilim (medyan)",
+                                     line=dict(color="orange", width=2, dash="dash")))
+            fig.update_layout(height=420, margin=dict(t=30, b=10),
+                              title="Son 6 saat + önümüzdeki 6 saat olası aralık")
+            st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"*Olasılık örnek sayısı: {nsample}. Koni bir TAHMİN değil; mevcut oynaklığa göre "
+                   "olası fiyat ARALIĞIDIR. Turuncu çizgi mevcut momentumun hafif eğilimidir, hedef değildir. "
+                   "Kaldıraçlı ETF'ler BTC değil MSTR'ı takip eder — baz riskini unutma.")
+
+# ===========================================================================
+# TAB 2 — Sinyaller & Pozisyonlar
+# ===========================================================================
+with tabs[2]:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Son Sinyaller")
@@ -196,7 +337,7 @@ with tabs[1]:
 # ===========================================================================
 # TAB 3 — Performans (Sanal Portfoy)
 # ===========================================================================
-with tabs[2]:
+with tabs[3]:
     st.subheader("💼 Sanal Portfoy (gercek ETF fiyatlariyla kagit islem)")
     st.caption("Bot sinyalleri gercek ETF fiyatindan kagit uzerinde al/sat edilir; "
                "botun gercek basarisini zamanla olcer. Gercek para degildir.")
@@ -254,7 +395,7 @@ with tabs[2]:
 # ===========================================================================
 # TAB 4 — Yonetim
 # ===========================================================================
-with tabs[3]:
+with tabs[4]:
     st.subheader("Hizli Kontroller")
     b = st.columns(4)
     if b[0].button("▶️ Devam et" if paused else "⏸️ Durdur"):

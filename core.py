@@ -598,3 +598,130 @@ def is_tradeable(status: Optional[str] = None) -> bool:
     """Midas'ta islem yapilabilir mi (normal + uzatilmis saatler)."""
     s = status or us_market_status()
     return s in ("OPEN", "PRE", "AFTER")
+
+
+# ===========================================================================
+# Coklu zaman dilimi (MTF) analizi + 6 saatlik koni + ampirik olasilik
+# ===========================================================================
+def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 400) -> pd.DataFrame:
+    """Binance'tan herhangi bir zaman diliminde OHLCV (anahtar gerekmez)."""
+    try:
+        import requests
+        url = f"{BINANCE_API_URL}?symbol={symbol}&interval={interval}&limit={limit}"
+        data = requests.get(url, timeout=10).json()
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
+        df = pd.DataFrame([{
+            "timestamp": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+            "low": float(r[3]), "close": float(r[4]), "volume": float(r[5]),
+        } for r in data])
+        df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """yfinance ciktisini (Open/High/.. + DatetimeIndex) ortak formata cevirir."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.rename(columns={c: c.lower() for c in df.columns}).copy()
+    idx = pd.to_datetime(out.index, utc=True)
+    out = out.reset_index(drop=True)
+    out["timestamp_dt"] = idx
+    keep = [c for c in ["open", "high", "low", "close", "volume", "timestamp_dt"] if c in out.columns]
+    return out[keep].dropna()
+
+
+def mtf_score(df: pd.DataFrame) -> Tuple[float, str, Dict]:
+    """Tek bir zaman dilimi OHLCV df'inden yon skoru (-100..100) + etiket.
+    Trend (EMA20/50), RSI (seviye+egim), MACD ve trend gucu (ADX) birlesir."""
+    if df is None or len(df) < 55:
+        return 0.0, "VERI YOK", {}
+    close = df["close"]
+    ema_f = close.ewm(span=20, adjust=False).mean()
+    ema_s = close.ewm(span=50, adjust=False).mean()
+    rsi = IndicatorCalc.rsi(close, 14)
+    macd, sig = IndicatorCalc.macd(close)
+    adx, _, _ = IndicatorCalc.adx(df)
+
+    def clamp(x):
+        return max(-1.0, min(1.0, x))
+
+    votes = [
+        (1.0 if close.iloc[-1] > ema_s.iloc[-1] else -1.0, 2.0),   # fiyat vs EMA50
+        (1.0 if ema_f.iloc[-1] > ema_s.iloc[-1] else -1.0, 1.5),   # EMA20 vs EMA50
+        (clamp((rsi.iloc[-1] - 50) / 25), 1.0),                    # RSI seviye
+        (1.0 if rsi.iloc[-1] > rsi.iloc[-2] else -1.0, 0.6),       # RSI egim
+        (1.0 if (macd.iloc[-1] - sig.iloc[-1]) > 0 else -1.0, 1.5),  # MACD
+    ]
+    total_w = sum(w for _, w in votes)
+    score = sum(v * w for v, w in votes) / total_w * 100
+    adx_last = float(adx.iloc[-1]) if pd.notna(adx.iloc[-1]) else 0.0
+
+    if score >= 20 and adx_last >= 20:
+        label = "YUKARI"
+    elif score <= -20 and adx_last >= 20:
+        label = "ASAGI"
+    elif score >= 12:
+        label = "ZAYIF YUKARI"
+    elif score <= -12:
+        label = "ZAYIF ASAGI"
+    else:
+        label = "NOTR"
+    return round(score, 1), label, {"adx": round(adx_last, 1), "rsi": round(float(rsi.iloc[-1]), 1)}
+
+
+def forecast_cone(df: pd.DataFrame, horizon_hours: float = 6, bar_minutes: int = 5,
+                  drift_bias: float = 0.0) -> Dict:
+    """Volatilite konisi: son fiyattan baslayip ATR/oynaklik ile olasi ARALIK cizer.
+    Tahmin degil senaryo; drift_bias (-1..1) hafif yon egilimi verir (skordan)."""
+    if df is None or len(df) < 50:
+        return {}
+    close = df["close"]
+    logret = np.log(close / close.shift(1)).dropna()
+    sigma_bar = float(logret.tail(288).std())  # son ~1 gunluk 5dk oynakligi
+    if not np.isfinite(sigma_bar) or sigma_bar <= 0:
+        return {}
+    n = int(horizon_hours * 60 / bar_minutes)
+    steps = np.arange(1, n + 1)
+    last_price = float(close.iloc[-1])
+    last_time = df["timestamp_dt"].iloc[-1]
+    mu_bar = clamp_drift(drift_bias) * (sigma_bar * 0.3)  # mutevazi drift
+    sigma_t = sigma_bar * np.sqrt(steps)
+    times = [last_time + pd.Timedelta(minutes=bar_minutes * int(s)) for s in steps]
+    return {
+        "times": times,
+        "median": last_price * np.exp(mu_bar * steps),
+        "upper1": last_price * np.exp(mu_bar * steps + sigma_t),
+        "lower1": last_price * np.exp(mu_bar * steps - sigma_t),
+        "upper2": last_price * np.exp(mu_bar * steps + 2 * sigma_t),
+        "lower2": last_price * np.exp(mu_bar * steps - 2 * sigma_t),
+        "last_price": last_price,
+        "last_time": last_time,
+        "sigma_6h_pct": round(float(sigma_bar * np.sqrt(n)) * 100, 2),
+    }
+
+
+def clamp_drift(x: float) -> float:
+    return max(-1.0, min(1.0, x))
+
+
+def empirical_up_probability(df: pd.DataFrame, horizon_bars: int = 72) -> Tuple[Optional[float], int]:
+    """Gecmiste, SU ANKI rejime (trend + momentum yonu) benzer durumlarda fiyatin
+    sonraki `horizon_bars` icinde yukari kapama orani. Tahmin degil, baz oran."""
+    if df is None or len(df) < horizon_bars + 200:
+        return None, 0
+    close = df["close"].reset_index(drop=True)
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    macd, sig = IndicatorCalc.macd(close)
+    trend_up = close > ema50
+    mom_up = (macd - sig) > 0
+    fut = close.shift(-horizon_bars)
+    up = fut > close
+    cu, cm = bool(trend_up.iloc[-1]), bool(mom_up.iloc[-1])
+    mask = (trend_up == cu) & (mom_up == cm) & up.notna()
+    sub = up[mask]
+    if len(sub) < 30:
+        return None, len(sub)
+    return round(float(sub.mean()) * 100, 1), int(len(sub))
