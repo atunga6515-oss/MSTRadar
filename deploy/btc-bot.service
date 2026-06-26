@@ -1,0 +1,17 @@
+[Unit]
+Description=BTC/MSTR ETF Signal Bot (worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# <<< KENDI KULLANICI ADIN VE YOLUNLA DEGISTIR >>>
+User=alper
+WorkingDirectory=/home/alper/btc_etf_bot
+ExecStart=/home/alper/btc_etf_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

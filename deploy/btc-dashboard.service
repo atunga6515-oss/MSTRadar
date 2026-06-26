@@ -1,0 +1,19 @@
+[Unit]
+Description=BTC/MSTR ETF Bot Dashboard (Streamlit, SADECE yerel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# <<< KENDI KULLANICI ADIN VE YOLUNLA DEGISTIR >>>
+User=alper
+WorkingDirectory=/home/alper/btc_etf_bot
+# 127.0.0.1 = sadece bu makineden erisim. VPN/Tailscale ile uzaktan kullanacaksan
+# adresi tailscale IP'ne cevirebilirsin; interneti acan 0.0.0.0 KULLANMA.
+ExecStart=/home/alper/btc_etf_bot/venv/bin/streamlit run dashboard.py \
+    --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

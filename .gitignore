@@ -1,0 +1,27 @@
+# Gizli anahtarlar - ASLA push etme
+.env
+
+# Sanal ortam (platforma ozel)
+venv/
+.venv/
+
+# Veritabani + WAL yan dosyalari + yedekler
+*.db
+*.db-wal
+*.db-shm
+backups/
+
+# Loglar
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
