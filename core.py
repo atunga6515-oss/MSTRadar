@@ -54,6 +54,10 @@ ENV_DEFAULTS = {
     "MAX_HOLD_HOURS": os.getenv("MAX_HOLD_HOURS", "48"),      # zaman bazli cikis
     "MARKET_HOURS_ONLY": os.getenv("MARKET_HOURS_ONLY", "false"),  # sadece ABD seansinda tam sinyal
     "PAUSED": os.getenv("PAUSED", "false"),                  # dashboard'dan duraklatma
+    # --- Sinyal v2: MSTR teyit + chop filtresi ---
+    "USE_MSTR_CONFIRM": os.getenv("USE_MSTR_CONFIRM", "true"),  # tam sinyalde MSTR ayni yonu teyit etsin
+    "CHOP_FILTER": os.getenv("CHOP_FILTER", "true"),           # yatay piyasada yeni pozisyon acma
+    "CHOP_CI_MAX": os.getenv("CHOP_CI_MAX", "61.8"),           # Choppiness Index > bu -> CHOP (trendsiz)
     # --- Sanal portfoy (paper trading) ---
     "PAPER_TRADING": os.getenv("PAPER_TRADING", "true"),    # sinyalleri kagit uzerinde takip et
     "PAPER_START_EQUITY": os.getenv("PAPER_START_EQUITY", "10000"),  # baslangic sermayesi ($)
@@ -440,6 +444,16 @@ class IndicatorCalc:
         return (direction * df['volume']).cumsum()
 
     @staticmethod
+    def choppiness(df: pd.DataFrame, window: int = 14) -> pd.Series:
+        """Choppiness Index (0-100). >61.8 = yatay/trendsiz (CHOP), <38.2 = guclu trend."""
+        high, low, close = df['high'], df['low'], df['close']
+        prev = close.shift(1)
+        tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+        atr_sum = tr.rolling(window).sum()
+        rng = high.rolling(window).max() - low.rolling(window).min()
+        return 100 * np.log10(atr_sum / rng.replace(0, np.nan)) / np.log10(window)
+
+    @staticmethod
     def enrich(df: pd.DataFrame) -> pd.DataFrame:
         """5dk df'e tum indikatorleri ekler (worker + backtest + dashboard ortak kullanir)."""
         df = df.reset_index(drop=True).copy()
@@ -598,6 +612,16 @@ def is_tradeable(status: Optional[str] = None) -> bool:
     """Midas'ta islem yapilabilir mi (normal + uzatilmis saatler)."""
     s = status or us_market_status()
     return s in ("OPEN", "PRE", "AFTER")
+
+
+def regime_from(adx: Optional[float], ci: Optional[float],
+                adx_min: float = 20, ci_chop: float = 61.8) -> str:
+    """Piyasa rejimi: CHOP (yatay), TREND (yonlu), ZAYIF (belirsiz)."""
+    if ci is not None and ci >= ci_chop:
+        return "CHOP"
+    if adx is not None and adx >= adx_min:
+        return "TREND"
+    return "ZAYIF"
 
 
 # ===========================================================================

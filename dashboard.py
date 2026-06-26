@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, us_market_status, csv_list,
                   alpaca_latest_prices, fetch_klines, normalize_ohlc, mtf_score,
-                  forecast_cone, empirical_up_probability)
+                  forecast_cone, empirical_up_probability, regime_from)
 
 try:
     import yfinance as yf
@@ -161,6 +161,20 @@ top[3].metric("Acik Pozisyon", open_pos["direction"] if open_pos else "Yok")
 if top[4].button("🔄 Yenile"):
     st.cache_data.clear()
     st.rerun()
+
+# Kompakt rejim + MSTR teyit satiri (Sinyal v2)
+if not df.empty and len(df) > 30:
+    ci_now = IndicatorCalc.choppiness(df, 14).iloc[-1]
+    adx_now = df['adx'].iloc[-1] if 'adx' in df else None
+    reg = regime_from(float(adx_now) if pd.notna(adx_now) else None,
+                      float(ci_now) if pd.notna(ci_now) else None,
+                      settings.f("ADX_MIN"), settings.f("CHOP_CI_MAX") or 61.8)
+    reg_txt = {"TREND": "🟢 TREND (yönlü)", "CHOP": "🔴 CHOP (yatay — yeni pozisyon riskli)",
+               "ZAYIF": "🟡 ZAYIF (belirsiz)"}.get(reg, reg)
+    und = settings.s("UNDERLYING") or "MSTR"
+    _, mlabel = confluence(mtf_equity(und))
+    st.caption(f"🧭 **BTC Rejim:** {reg_txt}  ·  **{und} eğilim:** {dir_emoji(mlabel)} {mlabel}  "
+               f"·  Tam sinyal için chop dışı + {und} teyidi gerekir.")
 
 tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller & Pozisyonlar",
                 "📈 Performans", "⚙️ Yonetim"])
@@ -415,6 +429,7 @@ with tabs[4]:
     editable = ["SIGNAL_SCORE_THRESHOLD", "WATCH_SCORE_THRESHOLD", "ADX_MIN",
                 "ALERT_COOLDOWN_HOURS", "ATR_STOP_MULT", "MAX_HOLD_HOURS",
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
+                "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
                 "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING",
                 "PAPER_TRADING", "PAPER_START_EQUITY", "PAPER_ALLOC_PCT", "PAPER_FEE_PCT"]
     with st.form("config_form"):
