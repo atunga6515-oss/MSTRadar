@@ -1,18 +1,15 @@
 [Unit]
 Description=BTC/MSTR ETF Signal Bot (worker)
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-# <<< YOUR_USER yerine kendi Linux kullanici adini, yolu da kendi yolunla DEGISTIR >>>
-# (Linux'ta: kullanici adi -> `whoami`, tam yol -> proje klasorunde `pwd`)
-User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/btc_etf_bot
-ExecStart=/home/YOUR_USER/btc_etf_bot/venv/bin/python bot.py
+# %h = kullanici home dizini. Proje ~/MSTRadar altinda ise hicbir sey degistirmen GEREKMEZ.
+# Baska bir klasore koyduysan iki yoldaki "MSTRadar" kismini guncelle.
+WorkingDirectory=%h/MSTRadar
+ExecStart=%h/MSTRadar/venv/bin/python bot.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
