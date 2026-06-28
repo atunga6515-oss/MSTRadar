@@ -58,8 +58,11 @@ ENV_DEFAULTS = {
     "USE_MSTR_CONFIRM": os.getenv("USE_MSTR_CONFIRM", "true"),  # tam sinyalde MSTR ayni yonu teyit etsin
     "CHOP_FILTER": os.getenv("CHOP_FILTER", "true"),           # yatay piyasada yeni pozisyon acma
     "CHOP_CI_MAX": os.getenv("CHOP_CI_MAX", "61.8"),           # Choppiness Index > bu -> CHOP (trendsiz)
-    # --- Sanal portfoy (paper trading) ---
-    "PAPER_TRADING": os.getenv("PAPER_TRADING", "true"),    # sinyalleri kagit uzerinde takip et
+    # --- Kullanici portfoyu (elle girilen) + kademeli tavsiye ---
+    "HOLDING_STOP_PCT": os.getenv("HOLDING_STOP_PCT", "15"),   # ETF girise gore bu kadar dustuyse SAT
+    "PARTIAL_SELL_PCT": os.getenv("PARTIAL_SELL_PCT", "33"),   # PARCALI SAT'ta onerilen oran (%)
+    # --- Sanal portfoy (paper trading) — ARTIK KULLANILMIYOR (kullanici portfoyune gecildi) ---
+    "PAPER_TRADING": os.getenv("PAPER_TRADING", "false"),   # otomatik kagit islem (kapali)
     "PAPER_START_EQUITY": os.getenv("PAPER_START_EQUITY", "10000"),  # baslangic sermayesi ($)
     "PAPER_ALLOC_PCT": os.getenv("PAPER_ALLOC_PCT", "100"), # her sinyalde sermayenin %'si
     "PAPER_FEE_PCT": os.getenv("PAPER_FEE_PCT", "0.1"),     # islem basina komisyon+spread (%)
@@ -132,8 +135,15 @@ class Database:
                 entry_ts INTEGER, entry_price REAL,
                 exit_ts INTEGER, exit_price REAL,
                 fee REAL DEFAULT 0, pnl_abs REAL, status TEXT DEFAULT 'OPEN')''')
+            c.execute('''CREATE TABLE IF NOT EXISTS holdings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT, kind TEXT, qty REAL,
+                entry_price REAL, entry_ts INTEGER,
+                status TEXT DEFAULT 'OPEN',
+                exit_price REAL, exit_ts INTEGER, pnl_abs REAL, note TEXT)''')
             c.execute('CREATE INDEX IF NOT EXISTS idx_signals_asset_ts ON signals_history(asset_target, timestamp)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_holdings_status ON holdings(status)')
             conn.commit()
         self._seed_config()
 
@@ -309,6 +319,56 @@ class Database:
         with self.get_connection() as conn:
             return pd.read_sql_query(
                 f"SELECT * FROM paper_trades ORDER BY entry_ts DESC LIMIT {int(limit)}", conn)
+
+    # --- holdings (kullanici elle girer; bot buna gore yonlendirir) ---
+    def add_holding(self, asset: str, kind: str, qty: float, entry_price: float,
+                    entry_ts: int, note: str = "") -> int:
+        with self.get_connection() as conn:
+            cur = conn.execute('''INSERT INTO holdings
+                (asset, kind, qty, entry_price, entry_ts, status, note)
+                VALUES (?,?,?,?,?, 'OPEN', ?)''', (asset, kind, qty, entry_price, entry_ts, note))
+            conn.commit()
+            return cur.lastrowid
+
+    def get_open_holdings(self):
+        with self.get_connection() as conn:
+            return conn.execute("SELECT * FROM holdings WHERE status='OPEN' ORDER BY entry_ts").fetchall()
+
+    def get_holdings_df(self, limit: int = 200) -> pd.DataFrame:
+        with self.get_connection() as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM holdings ORDER BY entry_ts DESC LIMIT {int(limit)}", conn)
+
+    def close_holding(self, hid: int, exit_price: float, exit_ts: int):
+        with self.get_connection() as conn:
+            r = conn.execute("SELECT qty, entry_price FROM holdings WHERE id=?", (hid,)).fetchone()
+            pnl = (r["qty"] * (exit_price - r["entry_price"])) if r else None
+            conn.execute('''UPDATE holdings SET status='CLOSED', exit_price=?, exit_ts=?, pnl_abs=?
+                WHERE id=?''', (exit_price, exit_ts, pnl, hid))
+            conn.commit()
+
+    def partial_sell(self, hid: int, sell_qty: float, exit_price: float, exit_ts: int):
+        """Parcali sat: satilan kismi CLOSED kayit olarak ayir, kalani OPEN birak."""
+        with self.get_connection() as conn:
+            r = conn.execute("SELECT * FROM holdings WHERE id=?", (hid,)).fetchone()
+            if not r:
+                return
+            if sell_qty >= r["qty"]:
+                self.close_holding(hid, exit_price, exit_ts)
+                return
+            pnl = sell_qty * (exit_price - r["entry_price"])
+            conn.execute('''INSERT INTO holdings
+                (asset, kind, qty, entry_price, entry_ts, status, exit_price, exit_ts, pnl_abs, note)
+                VALUES (?,?,?,?,?, 'CLOSED', ?,?,?, ?)''',
+                         (r["asset"], r["kind"], sell_qty, r["entry_price"], r["entry_ts"],
+                          exit_price, exit_ts, pnl, "parcali sat"))
+            conn.execute("UPDATE holdings SET qty=qty-? WHERE id=?", (sell_qty, hid))
+            conn.commit()
+
+    def holdings_realized_pnl(self) -> float:
+        with self.get_connection() as conn:
+            r = conn.execute("SELECT COALESCE(SUM(pnl_abs),0) AS s FROM holdings WHERE status='CLOSED'").fetchone()
+            return float(r["s"] or 0.0)
 
     def purge_old_data(self, days: int = 45):
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
@@ -622,6 +682,47 @@ def regime_from(adx: Optional[float], ci: Optional[float],
     if adx is not None and adx >= adx_min:
         return "TREND"
     return "ZAYIF"
+
+
+def holding_advice(kind, score, regime, mstr_ok, rsi, live_price, entry_price, settings):
+    """Kullanicinin ELDEKI pozisyonuna gore kademeli tavsiye.
+    Donen: (advice, reason, fraction)
+      advice  : EKLE / TUT / PARCALI_SAT / SAT / AL (AL bu fonksiyonda uretilmez)
+      fraction: PARCALI_SAT/SAT icin satilacak oran (0-1), digerinde None
+    kind: 'BULL' (MSTU/MSTX) ya da 'BEAR' (MSTZ). dir_score = sinyalin LEHE puani."""
+    sig_thr = settings.f("SIGNAL_SCORE_THRESHOLD") or 40
+    watch_thr = settings.f("WATCH_SCORE_THRESHOLD") or 22
+    stop_pct = settings.f("HOLDING_STOP_PCT") or 15
+    part = (settings.f("PARTIAL_SELL_PCT") or 33) / 100.0
+    dir_score = score if kind == "BULL" else -score
+
+    # 1) Sert ETF stopu (gercek enstrumandaki zarar)
+    if live_price and entry_price:
+        dd = (live_price - entry_price) / entry_price * 100
+        if dd <= -stop_pct:
+            return "SAT", f"STOP: girise gore {dd:+.0f}% (>= {stop_pct:.0f}% zarar)", 1.0
+
+    # 2) Sert ters sinyal -> tam cikis
+    if dir_score <= -sig_thr:
+        return "SAT", f"Sinyal sert ters dondu (lehe skor {dir_score:+.0f})", 1.0
+
+    # 3) Aleyhine zayifliyor -> parcali sat
+    if dir_score < 0:
+        return "PARCALI_SAT", f"Sinyal aleyhine donuyor (lehe skor {dir_score:+.0f})", part
+
+    # 4) Yatay piyasada zayif lehte -> riski azalt (kaldiracli ETF erir)
+    if regime == "CHOP" and dir_score < watch_thr:
+        return "PARCALI_SAT", f"Yatay piyasa (chop), lehe skor zayif {dir_score:+.0f}", part
+
+    # 5) Guclu + trendli + teyitli + asiri degil -> EKLE
+    overbought = rsi is not None and ((kind == "BULL" and rsi >= 75) or (kind == "BEAR" and rsi <= 25))
+    if dir_score >= sig_thr and regime == "TREND" and mstr_ok is not False and not overbought:
+        return "EKLE", f"Guclu ve devam ediyor (lehe skor {dir_score:+.0f})", None
+
+    # 6) Lehine ama temkinli -> TUT
+    if overbought:
+        return "TUT", f"Lehine ama asiri (RSI={rsi:.0f}); ekleme yapma", None
+    return "TUT", f"Lehine, temkinli tut (lehe skor {dir_score:+.0f})", None
 
 
 # ===========================================================================

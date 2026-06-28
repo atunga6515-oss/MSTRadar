@@ -19,7 +19,7 @@ from core import (
     Database, Settings, IndicatorCalc, SignalScorer,
     BINANCE_API_URL, BINANCE_FAPI, MIN_CANDLES, NY_TZ, TR_TZ,
     f_or_none, us_market_status, is_tradeable, alpaca_latest_prices,
-    normalize_ohlc, mtf_score, regime_from,
+    normalize_ohlc, mtf_score, regime_from, holding_advice,
 )
 
 # ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ class TradingEngine:
         self.settings = settings
         self.fetcher = fetcher
         self.notifier = notifier
-        self._watch_last_sent: Dict[str, int] = {}  # bellek-ici watch cooldown {direction: ts_ms}
+        self._last_advice_sig = None  # anti-spam: son tavsiye imzasi
 
     # ---- sentiment trend yardimcilari ----
     def _sentiment_trends(self, current: Dict[str, Optional[float]]):
@@ -288,202 +288,113 @@ class TradingEngine:
         elif score <= -watch_thr:
             action, is_watch = "BEARISH_SETUP", True
 
-        # --- SINYAL v2 kapilari: sadece TAM sinyalde (is_watch False) calisir ---
+        # Kullanici portfoyu + ETF fiyatlari + MSTR yonu (teyit) — gerekiyorsa cek
+        holdings = self.db.get_open_holdings()
+        need_data = bool(holdings) or action is not None
+        etf_prices = self.fetcher.fetch_etf_prices() if need_data else {}
+        mstr = self.fetcher.fetch_underlying_score() if (need_data and self.settings.b("USE_MSTR_CONFIRM")) else None
+        snapshot["mstr_confirm"] = mstr
+
+        # --- SINYAL v2 kapilari: yeni AL onerisini chop/MSTR/piyasa-saati ile suz ---
         gate_reason = None
         if action and not is_watch:
-            # 1) Chop filtresi: yatay piyasada yeni pozisyon acma -> TUT
             if self.settings.b("CHOP_FILTER") and regime == "CHOP":
                 is_watch = True
                 gate_reason = f"CHOP/yatay piyasa (CI={ci_val:.0f})"
-            # 2) MSTR teyidi: bu ETF'ler MSTR'i takip eder; MSTR ayni yonu teyit etmeli
-            if self.settings.b("USE_MSTR_CONFIRM"):
-                mstr = self.fetcher.fetch_underlying_score()
-                snapshot["mstr_confirm"] = mstr
-                if mstr is not None:
-                    want_up = (action == "BULLISH_SETUP")
-                    if want_up != (mstr["score"] > 0):
-                        is_watch = True
-                        gate_reason = ((gate_reason + " + ") if gate_reason else "") + \
-                                      f"MSTR teyit yok ({mstr['label']} {mstr['score']:+.0f})"
+            if mstr is not None:
+                if (action == "BULLISH_SETUP") != (mstr["score"] > 0):
+                    is_watch = True
+                    gate_reason = ((gate_reason + " + ") if gate_reason else "") + \
+                                  f"MSTR teyit yok ({mstr['label']} {mstr['score']:+.0f})"
+            if self.settings.b("MARKET_HOURS_ONLY") and not is_tradeable(us_market_status()):
+                is_watch = True
+                gate_reason = ((gate_reason + " + ") if gate_reason else "") + "piyasa kapali"
         snapshot["gate_reason"] = gate_reason
 
-        # ETF fiyatlarini gerekiyorsa bir kez cek (acik pozisyon ya da yeni sinyal varsa)
-        need_etf = self.db.get_open_position() is not None or action is not None
-        etf_prices = self.fetcher.fetch_etf_prices() if need_etf else {}
+        # Kullanicinin ELDEKI pozisyonuna gore kademeli tavsiye + kisisel bildirim
+        rsi_val = float(last_candle['rsi']) if pd.notna(last_candle['rsi']) else None
+        self._advise(ts, current_price, action, is_watch, score, regime, ci_val, gate_reason,
+                     mstr, etf_prices, holdings, rsi_val, macro_trend, force_alert)
 
-        # 1) ONCE acik pozisyonun cikis kosullari (paper kapanisi icin etf_prices gerekli)
-        self._manage_open_position(ts, current_price, score, adx_val, gap_msg, etf_prices)
-
-        # 2) Yeni sinyal
-        if action:
-            self._handle_signal(action, is_watch, ts, current_price, macro_trend, score,
-                                confidence, atr_val, breakdown, snapshot, gap_msg, etf_prices,
-                                regime=regime, gate_reason=gate_reason)
-        else:
-            logger.info(f"Sinyal yok. Skor:{score:+.0f} ADX:{adx_val:.0f} Trend:{macro_trend} "
-                        f"Fiyat:{current_price:.0f}")
-            if force_alert:
-                self._send_status_report(current_price, score, adx_val, macro_trend,
-                                         last_candle, sentiment, thr)
-
-    # ---- paper trading yardimcilari ----
-    def _paper_open(self, pos_id, assets, etf_prices, ts):
-        if not self.settings.b("PAPER_TRADING"):
-            return
-        equity = self.db.paper_equity(self.settings.f("PAPER_START_EQUITY"))
-        alloc = equity * (self.settings.f("PAPER_ALLOC_PCT") / 100.0)
-        self.db.open_paper_trades(pos_id, assets, etf_prices, ts, alloc, self.settings.f("PAPER_FEE_PCT"))
-        logger.info(f"Paper trade opened pos={pos_id} alloc=${alloc:.0f}")
-
-    def _paper_close(self, pos_id, etf_prices, ts):
-        if not self.settings.b("PAPER_TRADING"):
-            return
-        self.db.close_paper_trades(pos_id, etf_prices or {}, ts, self.settings.f("PAPER_FEE_PCT"))
-
-    # ---- pozisyon yasam dongusu ----
-    def _manage_open_position(self, ts: int, price: float, score: float, adx_val: float,
-                              gap_msg: str, etf_prices: Dict[str, float]):
-        pos = self.db.get_open_position()
-        if not pos:
-            return
-        reason = None
-        # a) Stop seviyesi
-        if pos["direction"] == "BULL" and pos["stop_btc"] and price <= pos["stop_btc"]:
-            reason = f"STOP (BTC {price:.0f} <= {pos['stop_btc']:.0f})"
-        elif pos["direction"] == "BEAR" and pos["stop_btc"] and price >= pos["stop_btc"]:
-            reason = f"STOP (BTC {price:.0f} >= {pos['stop_btc']:.0f})"
-        # b) Ters tam sinyal (momentum dondu)
-        thr = self.settings.f("SIGNAL_SCORE_THRESHOLD")
-        if reason is None:
-            if pos["direction"] == "BULL" and score <= -thr:
-                reason = "TERS SINYAL (skor dususe dondu)"
-            elif pos["direction"] == "BEAR" and score >= thr:
-                reason = "TERS SINYAL (skor yukselise dondu)"
-        # c) Maksimum tutma suresi
-        if reason is None:
-            max_hold = self.settings.f("MAX_HOLD_HOURS")
-            held_h = (ts - pos["entry_ts"]) / (1000 * 3600)
-            if max_hold > 0 and held_h >= max_hold:
-                reason = f"ZAMAN ASIMI ({held_h:.0f}s >= {max_hold:.0f}s)"
-
-        if reason:
-            self._paper_close(pos["id"], etf_prices, ts)  # once kagit pozisyonu gercek ETF fiyatindan kapat
-            self.db.close_position(pos["id"], ts, price, reason)
-            pnl = (price - pos["entry_btc"]) / pos["entry_btc"] * 100
-            pnl = pnl if pos["direction"] == "BULL" else -pnl
-            self.notifier.send_message(
-                f"🔚 *POZISYON KAPAT: {pos['assets']}*\n"
-                f"Sebep: {reason}\n"
-                f"Giris BTC: ${pos['entry_btc']:,.0f}  →  Cikis: ${price:,.0f}\n"
-                f"BTC bazli yaklasik getiri: {pnl:+.2f}% "
-                f"(ETF kaldiracli ~{abs(pnl)*2:.0f}%+ olabilir)\n"
-                f"_Not: Emri sen kapatacaksin, bot otomatik islem yapmaz._")
-            logger.info(f"Position {pos['id']} closed: {reason}")
-
-    def _handle_signal(self, action, is_watch, ts, price, macro_trend, score, confidence,
-                       atr_val, breakdown, snapshot, gap_msg, etf_prices,
-                       regime="", gate_reason=None):
+    # ---- kullanici portfoyune gore kademeli tavsiye ----
+    def _advise(self, ts, btc_price, action, is_watch, score, regime, ci_val, gate_reason,
+                mstr, etf_prices, holdings, rsi, macro_trend, force_alert):
         settings = self.settings
         bull = settings.list("ASSETS_BULL")
         bear = settings.list("ASSETS_BEAR")
-        if action == "BULLISH_SETUP":
-            targets_buy, targets_sell, direction, desired_type = bull, bear, "BULL", "BUY"
-        else:
-            targets_buy, targets_sell, direction, desired_type = bear, bull, "BEAR", "SELL"
 
-        market = us_market_status()
-        # Piyasa saati filtresi: Midas'ta islem yapilamayan saatte tam sinyali watch'a dusur
-        if settings.b("MARKET_HOURS_ONLY") and not is_tradeable(market) and not is_watch:
-            is_watch = True
+        lines, sig_parts = [], []
+        for h in holdings:
+            asset = h["asset"]
+            kind = h["kind"] or ("BULL" if asset in bull else "BEAR")
+            live = etf_prices.get(asset)
+            mstr_ok = None
+            if mstr is not None:
+                mstr_ok = ((mstr["score"] > 0) == (kind == "BULL"))
+            advice, reason, frac = holding_advice(kind, score, regime, mstr_ok, rsi,
+                                                  live, h["entry_price"], settings)
+            pl = f"  (P/L {(live - h['entry_price']) / h['entry_price'] * 100:+.1f}%)" \
+                 if (live and h["entry_price"]) else ""
+            emoji = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT",
+                     "PARCALI_SAT": "🟠 PARÇALI SAT", "SAT": "🔴 SAT"}[advice]
+            extra = ""
+            if advice == "PARCALI_SAT" and frac:
+                extra = f" (~%{frac * 100:.0f} ≈ {h['qty'] * frac:,.0f} adet)"
+            elif advice == "SAT":
+                extra = f" (tümü ≈ {h['qty']:,.0f} adet)"
+            lines.append(f"• {h['qty']:,.0f} {asset}{pl} → {emoji}{extra}\n    {reason}")
+            sig_parts.append(f"{asset}:{advice}")
 
-        if is_watch:
-            # bellek-ici watch cooldown (her 5dk tekrar etmesin)
-            last = self._watch_last_sent.get(direction, 0)
-            cooldown_ms = settings.f("ALERT_COOLDOWN_HOURS") * 3600 * 1000
-            if ts - last < cooldown_ms:
-                logger.info(f"Watch suppressed ({direction}).")
-                return
-            self._watch_last_sent[direction] = ts
-        else:
-            # DB tabanli anti-spam (ayni yon + cooldown icinde tekrar etme)
-            last_sig = self.db.get_last_signal(targets_buy[0])
-            if last_sig:
-                last_time, last_type = last_sig
-                hrs = (ts - last_time) / (1000 * 3600)
-                if last_type == desired_type and hrs < settings.f("ALERT_COOLDOWN_HOURS"):
-                    logger.info("Full signal suppressed by anti-spam.")
-                    return
-            # Sinyali kaydet + pozisyon ac (zaten ayni yonde acik degilse)
-            for a in targets_buy:
-                self.db.insert_signal(ts, a, desired_type, price, snapshot)
-            for a in targets_sell:
-                self.db.insert_signal(ts, a, "SELL" if desired_type == "BUY" else "BUY", price, snapshot)
-            self._open_position_if_needed(direction, targets_buy, ts, price, score, atr_val, etf_prices)
+        # Elde bir sey yoksa: net & teyitli sinyal varsa AL oner, yoksa BEKLE
+        flat_reco = None
+        if not holdings:
+            if action and not is_watch:
+                buy = bull if action == "BULLISH_SETUP" else bear
+                flat_reco = ("AL", buy)
+                sig_parts.append("FLAT:AL:" + ",".join(buy))
+            else:
+                sig_parts.append("FLAT:BEKLE")
 
-        self._send_alert(action, is_watch, price, macro_trend, score, confidence,
-                         atr_val, breakdown, targets_buy, targets_sell, etf_prices, market, gap_msg,
-                         regime=regime, gate_reason=gate_reason)
+        # Anti-spam: tavsiye durumu degismediyse ve eylem yoksa gonderme
+        sig = "|".join(sorted(sig_parts))
+        actionable = any(x in sig for x in ("EKLE", "PARCALI_SAT", "SAT", "AL"))
+        if sig == getattr(self, "_last_advice_sig", None) and not force_alert:
+            logger.info(f"Tavsiye degismedi, bildirim atlandi ({sig}).")
+            return
+        self._last_advice_sig = sig
+        if not actionable and not force_alert:
+            logger.info(f"Sadece TUT/BEKLE — bildirim atlandi ({sig}).")
+            return
 
-    def _open_position_if_needed(self, direction, targets_buy, ts, price, score, atr_val, etf_prices):
-        pos = self.db.get_open_position()
-        if pos and pos["direction"] == direction:
-            return  # zaten ayni yonde acik
-        if pos:  # ters yon -> once eskiyi (ve kagit pozisyonu) kapat
-            self._paper_close(pos["id"], etf_prices, ts)
-            self.db.close_position(pos["id"], ts, price, "TERS YENI SINYAL")
-        mult = self.settings.f("ATR_STOP_MULT") or 2.0
-        if direction == "BULL":
-            stop = price - mult * atr_val
-            target = price + 2 * mult * atr_val
-        else:
-            stop = price + mult * atr_val
-            target = price - 2 * mult * atr_val
-        pos_id = self.db.open_position(direction, ",".join(targets_buy), ts, price, score, stop, target)
-        self._paper_open(pos_id, targets_buy, etf_prices, ts)  # gercek ETF fiyatindan kagit pozisyon ac
-        logger.info(f"Position opened: {direction} @ {price:.0f} stop {stop:.0f}")
+        self._send_advice(lines, flat_reco, holdings, btc_price, score, regime,
+                          gate_reason, mstr, macro_trend)
 
-    def _send_alert(self, action, is_watch, price, macro_trend, score, confidence,
-                    atr_val, breakdown, targets_buy, targets_sell, etf_prices, market, gap_msg,
-                    regime="", gate_reason=None):
-        etf_str = "\n".join(f"• {k}: ${v:.2f}" for k, v in etf_prices.items()) if etf_prices else "Veri cekilemedi"
-        gap_section = f"\n{gap_msg}\n" if gap_msg else ""
-
-        # NET TALIMAT (AL / SAT / TUT) — her ETF icin tek acik komut
-        if is_watch:
-            head = "🟡 *TUT — YENI POZISYON ACMA*"
-            talimat = (f"📋 *TALIMAT:* TUT (bekle)\n"
-                       f"   Sebep: {gate_reason if gate_reason else 'Momentum henuz zayif (erken)'}\n"
-                       f"   Acik pozisyonun varsa koru; yeni giris icin teyit bekle.")
-        else:
-            yon = "YUKSELIS (BULLISH)" if action == "BULLISH_SETUP" else "DUSUS (BEARISH)"
-            head = f"🚨 *{yon} SINYALI* 🚨"
-            talimat = (f"📋 *TALIMAT:*\n"
-                       f"   🟢 AL: {' & '.join(targets_buy)}\n"
-                       f"   🔴 SAT/ELDEN CIKAR: {' & '.join(targets_sell)}")
-
-        macro_tr = "YUKSELIS" if macro_trend == "BULLISH" else ("DUSUS" if macro_trend == "BEARISH" else "NOTR")
-        market_tr = {
-            "OPEN": "ACIK (normal seans)",
-            "PRE": "PRE-MARKET (Midas'ta islem var, spread genis)",
-            "AFTER": "AFTER-HOURS (Midas'ta islem var, spread genis)",
-            "CLOSED": "KAPALI (islem yok)",
-        }[market]
+    def _send_advice(self, lines, flat_reco, holdings, btc_price, score, regime,
+                     gate_reason, mstr, macro_trend):
         regime_tr = {"TREND": "TREND (yonlu)", "CHOP": "CHOP (yatay-riskli)",
                      "ZAYIF": "ZAYIF (belirsiz)"}.get(regime, regime)
-        mult = self.settings.f("ATR_STOP_MULT") or 2.0
-        stop = price - mult * atr_val if action == "BULLISH_SETUP" else price + mult * atr_val
-        desc = " | ".join(f"{k}:{v:+.1f}" for k, v in breakdown.items())
-        stop_line = "" if is_watch else f"🛡️ *Onerilen Stop (BTC):* ${stop:,.0f}  (ATR={atr_val:.0f})\n"
-        msg = (f"{head}\n{gap_section}"
-               f"{talimat}\n\n"
-               f"📈 *Skor:* {score:+.0f}/100  |  *Guven:* %{confidence:.0f}\n"
-               f"🧭 *Rejim:* {regime_tr}\n"
-               f"{stop_line}"
-               f"🏛️ *ABD Piyasasi:* {market_tr}\n"
-               f"📊 BTC: ${price:,.2f}  |  Ana Trend (4S): {macro_tr}\n"
-               f"• Tetikleyiciler: {desc}\n\n"
-               f"💰 *ETF Fiyatlari:*\n{etf_str}\n\n"
-               f"_Islemi sen yapacaksin; bot otomatik emir gondermez._")
+        market_tr = {"OPEN": "ACIK", "PRE": "PRE-MARKET", "AFTER": "AFTER-HOURS",
+                     "CLOSED": "KAPALI"}[us_market_status()]
+        mstr_tr = f"{mstr['label']} ({mstr['score']:+.0f})" if mstr is not None else "veri yok"
+        macro_tr = "YUKSELIS" if macro_trend == "BULLISH" else ("DUSUS" if macro_trend == "BEARISH" else "NOTR")
+
+        if holdings:
+            body = "*📋 PORTFÖY TALİMATI*\n\n*Elindekiler:*\n" + "\n".join(lines)
+        elif flat_reco:
+            _, buy = flat_reco
+            body = ("*📋 PORTFÖY TALİMATI*\n\n"
+                    f"Elin boş. 🟢 *AL:* {' & '.join(buy)}\n"
+                    f"({macro_tr} yönünde teyitli, chop dışı sinyal)")
+        else:
+            body = ("*📋 PORTFÖY TALİMATI*\n\n"
+                    f"Elin boş. 🟡 *BEKLE* — net/teyitli sinyal yok"
+                    + (f"\n   ({gate_reason})" if gate_reason else "."))
+
+        msg = (f"{body}\n\n"
+               f"📈 Skor: {score:+.0f}/100  |  🧭 Rejim: {regime_tr}\n"
+               f"🏛️ MSTR yön: {mstr_tr}  |  ABD: {market_tr}\n"
+               f"📊 BTC: ${btc_price:,.0f}  |  Trend(4S): {macro_tr}\n"
+               f"_İşlemi sen yaparsın; bot otomatik emir göndermez._")
         self.notifier.send_message(msg)
 
     def _send_status_report(self, price, score, adx_val, macro_trend, last_candle, sentiment, thr):
@@ -520,15 +431,6 @@ class TradingEngine:
                 if name == "trigger":
                     logger.info("Command: manual trigger")
                     self.run_cycle(force_alert=True)
-                elif name == "close":
-                    pos = self.db.get_open_position()
-                    if pos:
-                        df = self.db.get_all_candles(limit=1)
-                        price = float(df.iloc[-1]['close']) if not df.empty else pos["entry_btc"]
-                        now_ms = int(time.time() * 1000)
-                        self._paper_close(pos["id"], self.fetcher.fetch_etf_prices(), now_ms)
-                        self.db.close_position(pos["id"], now_ms, price, "MANUEL (dashboard)")
-                        self.notifier.send_message(f"🔚 Pozisyon manuel kapatildi: {pos['assets']}")
                 elif name == "pause":
                     self.db.set_config("PAUSED", "true")
                 elif name == "resume":

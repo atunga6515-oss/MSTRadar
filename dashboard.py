@@ -17,9 +17,9 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from core import (Database, Settings, IndicatorCalc, us_market_status, csv_list,
+from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
                   alpaca_latest_prices, fetch_klines, normalize_ohlc, mtf_score,
-                  forecast_cone, empirical_up_probability, regime_from)
+                  forecast_cone, empirical_up_probability, regime_from, holding_advice)
 
 try:
     import yfinance as yf
@@ -176,8 +176,8 @@ if not df.empty and len(df) > 30:
     st.caption(f"🧭 **BTC Rejim:** {reg_txt}  ·  **{und} eğilim:** {dir_emoji(mlabel)} {mlabel}  "
                f"·  Tam sinyal için chop dışı + {und} teyidi gerekir.")
 
-tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller & Pozisyonlar",
-                "📈 Performans", "⚙️ Yonetim"])
+tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller",
+                "💼 Portföyüm", "⚙️ Yonetim"])
 
 # ===========================================================================
 # TAB 1 — Grafikler
@@ -321,90 +321,118 @@ with tabs[1]:
                    "Kaldıraçlı ETF'ler BTC değil MSTR'ı takip eder — baz riskini unutma.")
 
 # ===========================================================================
-# TAB 2 — Sinyaller & Pozisyonlar
+# TAB 2 — Sinyaller
 # ===========================================================================
 with tabs[2]:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Son Sinyaller")
-        sig = db.get_signals_df(50)
-        if sig.empty:
-            st.info("Henuz sinyal yok.")
-        else:
-            sig['zaman'] = sig['timestamp'].apply(fmt_ts)
-            sig['skor'] = sig['indicator_snapshots'].apply(
-                lambda s: json.loads(s).get('score') if s else None)
-            st.dataframe(sig[['zaman', 'asset_target', 'signal_type', 'btc_price', 'skor']],
-                         use_container_width=True, height=400)
-    with c2:
-        st.subheader("Pozisyonlar")
-        pos = db.get_positions_df(50)
-        if pos.empty:
-            st.info("Henuz pozisyon yok.")
-        else:
-            pos['giris'] = pos['entry_ts'].apply(fmt_ts)
-            pos['cikis'] = pos['exit_ts'].apply(fmt_ts)
-            show = pos[['giris', 'direction', 'assets', 'entry_btc', 'stop_btc',
-                        'status', 'cikis', 'exit_btc', 'pnl_btc_pct', 'exit_reason']]
-            st.dataframe(show, use_container_width=True, height=400)
+    st.subheader("Son Sinyaller / Tavsiyeler")
+    sig = db.get_signals_df(80)
+    if sig.empty:
+        st.info("Henuz kayitli sinyal yok.")
+    else:
+        sig['zaman'] = sig['timestamp'].apply(fmt_ts)
+        sig['skor'] = sig['indicator_snapshots'].apply(
+            lambda s: json.loads(s).get('score') if s else None)
+        st.dataframe(sig[['zaman', 'asset_target', 'signal_type', 'btc_price', 'skor']],
+                     use_container_width=True, height=460)
 
 # ===========================================================================
-# TAB 3 — Performans (Sanal Portfoy)
+# TAB 3 — Portföyüm (kullanici elle girer, bot yonlendirir)
 # ===========================================================================
 with tabs[3]:
-    st.subheader("💼 Sanal Portfoy (gercek ETF fiyatlariyla kagit islem)")
-    st.caption("Bot sinyalleri gercek ETF fiyatindan kagit uzerinde al/sat edilir; "
-               "botun gercek basarisini zamanla olcer. Gercek para degildir.")
+    st.subheader("💼 Portföyüm")
+    st.caption("Aldığın ETF'leri buraya gir; bot **senin elindekine göre** AL/EKLE/TUT/PARÇALI SAT/SAT "
+               "yönlendirir. Bot otomatik işlem yapmaz, kararı sen verirsin.")
 
-    start_eq = settings.f("PAPER_START_EQUITY") or 10000
-    pt = db.get_paper_trades_df(1000)
-    closed_pt = pt[pt['status'] == 'CLOSED'].copy() if not pt.empty else pd.DataFrame()
-    open_pt = db.get_open_paper_trades()
+    bull = settings.list("ASSETS_BULL")
+    bear = settings.list("ASSETS_BEAR")
+    all_assets = bull + bear
+    live_now = live_prices(all_assets)
 
-    realized = closed_pt['pnl_abs'].sum() if not closed_pt.empty else 0.0
-    equity = start_eq + realized
+    # --- Mevcut piyasa durumu (tavsiye uretmek icin) ---
+    score_now, regime_now, rsi_now, mstr_score = None, None, None, None
+    if not df.empty and len(df) > 250:
+        try:
+            df4 = IndicatorCalc.resample_4h(df)
+            last4 = df4.iloc[-1]
+            score_now, _ = SignalScorer.score(df.iloc[-1], df.iloc[-2], last4, last_price, None)
+            rsi_now = float(df['rsi'].iloc[-1])
+            ci_n = IndicatorCalc.choppiness(df, 14).iloc[-1]
+            regime_now = regime_from(float(df['adx'].iloc[-1]), float(ci_n),
+                                     settings.f("ADX_MIN"), settings.f("CHOP_CI_MAX") or 61.8)
+            ms, _ = confluence(mtf_equity(settings.s("UNDERLYING") or "MSTR"))
+            mstr_score = ms
+        except Exception:
+            pass
 
-    # Acik kagit pozisyonlarin guncel mark-to-market (once Alpaca, sonra yfinance)
-    mtm = 0.0
-    if not open_pt.empty:
-        live = live_prices(list(open_pt['asset'].unique()))
-        for _, r in open_pt.iterrows():
-            cur = live.get(r['asset'])
-            if cur:
-                mtm += r['qty'] * (cur - r['entry_price'])
+    # --- Yeni alım gir ---
+    with st.expander("➕ Yeni alım ekle", expanded=False):
+        with st.form("add_holding"):
+            cc = st.columns(4)
+            a = cc[0].selectbox("ETF", all_assets)
+            q = cc[1].number_input("Adet", min_value=0.0, value=100.0, step=10.0)
+            default_px = float(live_now.get(a, 0) or 0)
+            p = cc[2].number_input("Alış fiyatı ($)", min_value=0.0, value=round(default_px, 2), step=0.1)
+            note = cc[3].text_input("Not", value="")
+            if st.form_submit_button("Ekle"):
+                kind = "BULL" if a in bull else "BEAR"
+                db.add_holding(a, kind, q, p, int(datetime.now(timezone.utc).timestamp() * 1000), note)
+                st.success(f"Eklendi: {q:,.0f} {a} @ ${p:.2f}")
+                st.cache_data.clear()
+                st.rerun()
 
-    m = st.columns(4)
-    m[0].metric("Sermaye (baslangic)", f"${start_eq:,.0f}")
-    m[1].metric("Guncel Oz Sermaye", f"${equity + mtm:,.0f}",
-                f"{(equity + mtm - start_eq)/start_eq*100:+.1f}%")
-    m[2].metric("Gerceklesen K/Z", f"${realized:+,.0f}")
-    m[3].metric("Acik pozisyon (MTM)", f"${mtm:+,.0f}" if not open_pt.empty else "Yok")
-
-    if closed_pt.empty:
-        st.info("Henuz kapanmis kagit islem yok. Bot sinyal urettikce burada birikir.")
+    # --- Açık pozisyonlar + bot tavsiyesi ---
+    holds = db.get_open_holdings()
+    if not holds:
+        # el bos -> AL onerisi
+        if score_now is not None and regime_now == "TREND" and abs(score_now) >= settings.f("SIGNAL_SCORE_THRESHOLD"):
+            buy = bull if score_now > 0 else bear
+            st.success(f"Elin boş. 🟢 Şu an öneri: **AL {' & '.join(buy)}** "
+                       f"(skor {score_now:+.0f}, {regime_now})")
+        else:
+            st.info("Elin boş. 🟡 Şu an net/teyitli sinyal yok — **BEKLE**.")
     else:
-        wins = (closed_pt['pnl_abs'] > 0).sum()
-        n = len(closed_pt)
-        closed_pt = closed_pt.sort_values('entry_ts')
-        closed_pt['kumulatif'] = start_eq + closed_pt['pnl_abs'].cumsum()
-        run_max = closed_pt['kumulatif'].cummax()
-        max_dd = ((closed_pt['kumulatif'] - run_max) / run_max).min() * 100
+        st.markdown("**Açık pozisyonların + bot tavsiyesi:**")
+        for h in holds:
+            asset, kind, qty = h["asset"], h["kind"], h["qty"]
+            live = live_now.get(asset)
+            advice, reason, frac = ("—", "veri yok", None)
+            if score_now is not None:
+                mstr_ok = None if mstr_score is None else ((mstr_score > 0) == (kind == "BULL"))
+                advice, reason, frac = holding_advice(kind, score_now, regime_now, mstr_ok,
+                                                      rsi_now, live, h["entry_price"], settings)
+            pl = ((live - h["entry_price"]) / h["entry_price"] * 100) if (live and h["entry_price"]) else None
+            badge = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT", "PARCALI_SAT": "🟠 PARÇALI SAT",
+                     "SAT": "🔴 SAT", "—": "⚪ —"}[advice]
+            cc = st.columns([3, 2, 2, 2, 2])
+            cc[0].markdown(f"**{qty:,.0f} {asset}**  \nGiriş ${h['entry_price']:.2f}"
+                           + (f" · Canlı ${live:.2f}" if live else ""))
+            cc[1].metric("P/L", f"{pl:+.1f}%" if pl is not None else "–")
+            cc[2].markdown(f"### {badge}")
+            if cc[3].button("Parçalı Sat", key=f"ps{h['id']}", disabled=not live):
+                sell_q = qty * ((settings.f("PARTIAL_SELL_PCT") or 33) / 100.0)
+                db.partial_sell(h["id"], sell_q, live, int(datetime.now(timezone.utc).timestamp() * 1000))
+                st.cache_data.clear(); st.rerun()
+            if cc[4].button("Tümünü Sat", key=f"cl{h['id']}", disabled=not live):
+                db.close_holding(h["id"], live, int(datetime.now(timezone.utc).timestamp() * 1000))
+                st.cache_data.clear(); st.rerun()
+            st.caption(f"📋 {reason}")
+            st.divider()
 
-        s = st.columns(4)
-        s[0].metric("Kapanan islem", n)
-        s[1].metric("Kazanc orani", f"%{wins/n*100:.0f}")
-        s[2].metric("Ort. K/Z / islem", f"${closed_pt['pnl_abs'].mean():+,.1f}")
-        s[3].metric("Max Drawdown", f"%{max_dd:.1f}")
-
-        st.markdown("**Oz sermaye egrisi**")
-        st.line_chart(closed_pt.set_index(closed_pt['exit_ts'].apply(fmt_ts))['kumulatif'], height=260)
-
-        closed_pt['giris'] = closed_pt['entry_ts'].apply(fmt_ts)
-        closed_pt['cikis'] = closed_pt['exit_ts'].apply(fmt_ts)
-        st.dataframe(closed_pt[['giris', 'cikis', 'asset', 'qty', 'entry_price',
-                               'exit_price', 'fee', 'pnl_abs']],
-                     use_container_width=True, height=300)
-    st.caption("Daha genis donem testi icin: `python backtest.py --grid`")
+    # --- Gerçekleşen K/Z (kapanan pozisyonlar) ---
+    hdf = db.get_holdings_df(500)
+    closed = hdf[hdf['status'] == 'CLOSED'].copy() if not hdf.empty else pd.DataFrame()
+    if not closed.empty:
+        realized = closed['pnl_abs'].sum()
+        wins = (closed['pnl_abs'] > 0).sum()
+        st.markdown("---")
+        mm = st.columns(3)
+        mm[0].metric("Gerçekleşen K/Z", f"${realized:+,.0f}")
+        mm[1].metric("Kapanan işlem", len(closed))
+        mm[2].metric("Kazanç oranı", f"%{wins/len(closed)*100:.0f}")
+        closed['giris'] = closed['entry_ts'].apply(fmt_ts)
+        closed['cikis'] = closed['exit_ts'].apply(fmt_ts)
+        st.dataframe(closed[['giris', 'cikis', 'asset', 'qty', 'entry_price', 'exit_price', 'pnl_abs', 'note']],
+                     use_container_width=True, height=240)
 
 # ===========================================================================
 # TAB 4 — Yonetim
@@ -430,8 +458,8 @@ with tabs[4]:
                 "ALERT_COOLDOWN_HOURS", "ATR_STOP_MULT", "MAX_HOLD_HOURS",
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
-                "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING",
-                "PAPER_TRADING", "PAPER_START_EQUITY", "PAPER_ALLOC_PCT", "PAPER_FEE_PCT"]
+                "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT",
+                "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING"]
     with st.form("config_form"):
         new_vals = {}
         cc = st.columns(2)
