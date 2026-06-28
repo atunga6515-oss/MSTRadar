@@ -61,6 +61,10 @@ ENV_DEFAULTS = {
     # --- Kullanici portfoyu (elle girilen) + kademeli tavsiye ---
     "HOLDING_STOP_PCT": os.getenv("HOLDING_STOP_PCT", "15"),   # ETF girise gore bu kadar dustuyse SAT
     "PARTIAL_SELL_PCT": os.getenv("PARTIAL_SELL_PCT", "33"),   # PARCALI SAT'ta onerilen oran (%)
+    # --- Hafta sonu koruması (kaldiracli ETF gap riski) ---
+    "WEEKEND_FLAT": os.getenv("WEEKEND_FLAT", "true"),        # Cuma kapanisa yakin pozisyonlari kapat
+    "WEEKEND_FLAT_MIN": os.getenv("WEEKEND_FLAT_MIN", "20"),  # Cuma kapanistan kac dk once SAT uyarisi
+    "WEEKEND_NOENTRY_MIN": os.getenv("WEEKEND_NOENTRY_MIN", "90"),  # Cuma kapanistan kac dk once yeni AL yok
     # --- Sanal portfoy (paper trading) — ARTIK KULLANILMIYOR (kullanici portfoyune gecildi) ---
     "PAPER_TRADING": os.getenv("PAPER_TRADING", "false"),   # otomatik kagit islem (kapali)
     "PAPER_START_EQUITY": os.getenv("PAPER_START_EQUITY", "10000"),  # baslangic sermayesi ($)
@@ -682,6 +686,36 @@ def regime_from(adx: Optional[float], ci: Optional[float],
     if adx is not None and adx >= adx_min:
         return "TREND"
     return "ZAYIF"
+
+
+def weekend_state(now_utc: Optional[datetime] = None,
+                  flat_before: float = 20, noentry_before: float = 90) -> Optional[str]:
+    """Hafta sonu gap riski durumu (ABD borsa kapanisi 16:00 ET baz alinir):
+       FLATTEN  = Cuma kapanisa <flat_before> dk kala (ve sonrasi) -> pozisyonlari kapat
+       NO_ENTRY = Cuma kapanisa <noentry_before> dk kala -> yeni AL onerme
+       WEEKEND  = Cmt/Pazar -> piyasa kapali, hafta sonu
+       None     = normal."""
+    ny = (now_utc or datetime.now(timezone.utc)).astimezone(NY_TZ)
+    wd = ny.weekday()  # Pzt=0 ... Cuma=4, Cmt=5, Pazar=6
+    minutes = ny.hour * 60 + ny.minute
+    close = 16 * 60
+    if wd == 4:  # Cuma
+        if minutes >= close - flat_before:
+            return "FLATTEN"
+        if minutes >= close - noentry_before:
+            return "NO_ENTRY"
+    if wd in (5, 6):
+        return "WEEKEND"
+    return None
+
+
+def weekend_override(wstate: Optional[str]):
+    """Hafta sonu durumuna gore holding tavsiyesini ezer. (advice, reason, frac) ya da None."""
+    if wstate == "FLATTEN":
+        return "SAT", "🛡️ Hafta sonu koruması: seans kapanışı yakın, kaldıraçlı ETF'i elden çıkar", 1.0
+    if wstate == "WEEKEND":
+        return "SAT", "🛡️ Hafta sonu: piyasa kapalı — açılışta/pre-market kapat", 1.0
+    return None
 
 
 def holding_advice(kind, score, regime, mstr_ok, rsi, live_price, entry_price, settings):

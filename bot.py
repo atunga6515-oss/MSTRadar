@@ -20,6 +20,7 @@ from core import (
     BINANCE_API_URL, BINANCE_FAPI, MIN_CANDLES, NY_TZ, TR_TZ,
     f_or_none, us_market_status, is_tradeable, alpaca_latest_prices,
     normalize_ohlc, mtf_score, regime_from, holding_advice,
+    weekend_state, weekend_override,
 )
 
 # ---------------------------------------------------------------------------
@@ -323,6 +324,14 @@ class TradingEngine:
         bull = settings.list("ASSETS_BULL")
         bear = settings.list("ASSETS_BEAR")
 
+        # Hafta sonu koruması durumu
+        wstate = None
+        if settings.b("WEEKEND_FLAT"):
+            wstate = weekend_state(datetime.now(timezone.utc),
+                                   settings.f("WEEKEND_FLAT_MIN") or 20,
+                                   settings.f("WEEKEND_NOENTRY_MIN") or 90)
+        wk_override = weekend_override(wstate)
+
         lines, sig_parts = [], []
         for h in holdings:
             asset = h["asset"]
@@ -331,8 +340,11 @@ class TradingEngine:
             mstr_ok = None
             if mstr is not None:
                 mstr_ok = ((mstr["score"] > 0) == (kind == "BULL"))
-            advice, reason, frac = holding_advice(kind, score, regime, mstr_ok, rsi,
-                                                  live, h["entry_price"], settings)
+            if wk_override:  # hafta sonu koruması her seyin onunde
+                advice, reason, frac = wk_override
+            else:
+                advice, reason, frac = holding_advice(kind, score, regime, mstr_ok, rsi,
+                                                      live, h["entry_price"], settings)
             pl = f"  (P/L {(live - h['entry_price']) / h['entry_price'] * 100:+.1f}%)" \
                  if (live and h["entry_price"]) else ""
             emoji = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT",
@@ -346,14 +358,19 @@ class TradingEngine:
             sig_parts.append(f"{asset}:{advice}")
 
         # Elde bir sey yoksa: net & teyitli sinyal varsa AL oner, yoksa BEKLE
+        # (hafta sonu durumunda yeni giris onerilmez)
         flat_reco = None
         if not holdings:
-            if action and not is_watch:
+            if action and not is_watch and wstate is None:
                 buy = bull if action == "BULLISH_SETUP" else bear
                 flat_reco = ("AL", buy)
                 sig_parts.append("FLAT:AL:" + ",".join(buy))
             else:
                 sig_parts.append("FLAT:BEKLE")
+                if wstate and not gate_reason:
+                    gate_reason = {"FLATTEN": "hafta sonu yaklaşıyor, yeni giriş yok",
+                                   "NO_ENTRY": "Cuma kapanışı yakın, yeni giriş yok",
+                                   "WEEKEND": "hafta sonu, piyasa kapalı"}.get(wstate)
 
         # Anti-spam: tavsiye durumu degismediyse ve eylem yoksa gonderme
         sig = "|".join(sorted(sig_parts))

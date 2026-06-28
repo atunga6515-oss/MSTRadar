@@ -19,7 +19,8 @@ from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
                   alpaca_latest_prices, fetch_klines, normalize_ohlc, mtf_score,
-                  forecast_cone, empirical_up_probability, regime_from, holding_advice)
+                  forecast_cone, empirical_up_probability, regime_from, holding_advice,
+                  weekend_state, weekend_override)
 
 try:
     import yfinance as yf
@@ -348,6 +349,18 @@ with tabs[3]:
     all_assets = bull + bear
     live_now = live_prices(all_assets)
 
+    # Hafta sonu koruması durumu
+    wstate = weekend_state(datetime.now(timezone.utc), settings.f("WEEKEND_FLAT_MIN") or 20,
+                           settings.f("WEEKEND_NOENTRY_MIN") or 90) if settings.b("WEEKEND_FLAT") else None
+    wk_ovr = weekend_override(wstate)
+    if wstate == "FLATTEN":
+        st.error("🛡️ **HAFTA SONU KORUMASI** — Cuma kapanışı yakın. Kaldıraçlı ETF'leri "
+                 "elden çıkar; hafta sonu BTC hareketi Pazartesi gap'le 2x vurur.")
+    elif wstate == "NO_ENTRY":
+        st.warning("🛡️ Cuma öğleden sonra — yeni giriş önerilmez (hafta sonu gap riski).")
+    elif wstate == "WEEKEND":
+        st.info("🛡️ Hafta sonu, piyasa kapalı. Elinde pozisyon varsa Pazartesi açılışta/pre-market kapat.")
+
     # --- Mevcut piyasa durumu (tavsiye uretmek icin) ---
     score_now, regime_now, rsi_now, mstr_score = None, None, None, None
     if not df.empty and len(df) > 250:
@@ -383,11 +396,14 @@ with tabs[3]:
     # --- Açık pozisyonlar + bot tavsiyesi ---
     holds = db.get_open_holdings()
     if not holds:
-        # el bos -> AL onerisi
-        if score_now is not None and regime_now == "TREND" and abs(score_now) >= settings.f("SIGNAL_SCORE_THRESHOLD"):
+        # el bos -> AL onerisi (hafta sonu durumunda yeni giris yok)
+        if (wstate is None and score_now is not None and regime_now == "TREND"
+                and abs(score_now) >= settings.f("SIGNAL_SCORE_THRESHOLD")):
             buy = bull if score_now > 0 else bear
             st.success(f"Elin boş. 🟢 Şu an öneri: **AL {' & '.join(buy)}** "
                        f"(skor {score_now:+.0f}, {regime_now})")
+        elif wstate:
+            st.info("Elin boş. 🟡 Hafta sonu koruması aktif — **BEKLE** (yeni giriş yok).")
         else:
             st.info("Elin boş. 🟡 Şu an net/teyitli sinyal yok — **BEKLE**.")
     else:
@@ -396,7 +412,9 @@ with tabs[3]:
             asset, kind, qty = h["asset"], h["kind"], h["qty"]
             live = live_now.get(asset)
             advice, reason, frac = ("—", "veri yok", None)
-            if score_now is not None:
+            if wk_ovr:  # hafta sonu koruması her şeyin önünde
+                advice, reason, frac = wk_ovr
+            elif score_now is not None:
                 mstr_ok = None if mstr_score is None else ((mstr_score > 0) == (kind == "BULL"))
                 advice, reason, frac = holding_advice(kind, score_now, regime_now, mstr_ok,
                                                       rsi_now, live, h["entry_price"], settings)
@@ -459,6 +477,7 @@ with tabs[4]:
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
                 "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT",
+                "WEEKEND_FLAT", "WEEKEND_FLAT_MIN", "WEEKEND_NOENTRY_MIN",
                 "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING"]
     with st.form("config_form"):
         new_vals = {}
