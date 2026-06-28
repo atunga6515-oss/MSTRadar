@@ -61,6 +61,7 @@ ENV_DEFAULTS = {
     # --- Kullanici portfoyu (elle girilen) + kademeli tavsiye ---
     "HOLDING_STOP_PCT": os.getenv("HOLDING_STOP_PCT", "15"),   # ETF girise gore bu kadar dustuyse SAT
     "PARTIAL_SELL_PCT": os.getenv("PARTIAL_SELL_PCT", "33"),   # PARCALI SAT'ta onerilen oran (%)
+    "STOP_BUFFER_PCT": os.getenv("STOP_BUFFER_PCT", "1.5"),    # feed gurultusu icin stop toleransi
     # --- Hafta sonu koruması (kaldiracli ETF gap riski) ---
     "WEEKEND_FLAT": os.getenv("WEEKEND_FLAT", "true"),        # Cuma kapanisa yakin pozisyonlari kapat
     "WEEKEND_FLAT_MIN": os.getenv("WEEKEND_FLAT_MIN", "20"),  # Cuma kapanistan kac dk once SAT uyarisi
@@ -609,10 +610,9 @@ class SignalScorer:
         return round(score, 1), {label: round(v, 2) for v, _, label in votes}
 
 
-def alpaca_latest_prices(symbols) -> Dict[str, float]:
-    """Alpaca'dan en guncel ETF/hisse fiyatlari (ucretsiz IEX feed).
-    .env'de ALPACA_API_KEY / ALPACA_API_SECRET yoksa veya hata olursa bos doner
-    (cagiran taraf yfinance'a duser). Ucretsiz katman ~gercek zamanli (IEX)."""
+def alpaca_quotes(symbols) -> Dict[str, Dict]:
+    """Alpaca snapshot: her sembol icin {price, bid, ask, ts, source}.
+    Anahtar yoksa/hata olursa bos doner (cagiran yfinance'a duser). Ucretsiz = IEX feed."""
     key = os.getenv("ALPACA_API_KEY", "")
     secret = os.getenv("ALPACA_API_SECRET", "")
     if not key or not secret or not symbols:
@@ -626,22 +626,31 @@ def alpaca_latest_prices(symbols) -> Dict[str, float]:
                             timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        out: Dict[str, float] = {}
+        out: Dict[str, Dict] = {}
         for sym, snap in data.items():
             if not isinstance(snap, dict):
                 continue
-            price = None
             trade = snap.get("latestTrade") or {}
             quote = snap.get("latestQuote") or {}
+            bid = float(quote["bp"]) if quote.get("bp") else None
+            ask = float(quote["ap"]) if quote.get("ap") else None
+            price = None
             if trade.get("p"):
                 price = float(trade["p"])
-            elif quote.get("ap") and quote.get("bp"):  # alis/satis ortasi
-                price = (float(quote["ap"]) + float(quote["bp"])) / 2
+            elif bid and ask:
+                price = (bid + ask) / 2
             if price and price > 0:
-                out[sym] = price
+                out[sym] = {"price": price, "bid": bid, "ask": ask,
+                            "ts": trade.get("t") or quote.get("t"),
+                            "source": f"Alpaca/{feed.upper()}"}
         return out
     except Exception:
         return {}
+
+
+def alpaca_latest_prices(symbols) -> Dict[str, float]:
+    """Sadece fiyat dict'i (geriye uyumluluk icin)."""
+    return {s: q["price"] for s, q in alpaca_quotes(symbols).items() if q.get("price")}
 
 
 def f_or_none(x):
@@ -727,14 +736,23 @@ def holding_advice(kind, score, regime, mstr_ok, rsi, live_price, entry_price, s
     sig_thr = settings.f("SIGNAL_SCORE_THRESHOLD") or 40
     watch_thr = settings.f("WATCH_SCORE_THRESHOLD") or 22
     stop_pct = settings.f("HOLDING_STOP_PCT") or 15
+    buf = settings.f("STOP_BUFFER_PCT") or 1.5
     part = (settings.f("PARTIAL_SELL_PCT") or 33) / 100.0
     dir_score = score if kind == "BULL" else -score
 
-    # 1) Sert ETF stopu (gercek enstrumandaki zarar)
+    # 1) ETF stopu — feed gurultusune karsi TAMPON + BTC TEYIDI
+    #    Stop ancak (zarar >= stop+tampon) VE (BTC sinyali de aleyhte) ise tam SAT olur.
+    #    Zarar stop seviyesinde ama BTC hala lehte ise feed/spread suphesi -> parcali + Midas'tan teyit.
     if live_price and entry_price:
         dd = (live_price - entry_price) / entry_price * 100
-        if dd <= -stop_pct:
-            return "SAT", f"STOP: girise gore {dd:+.0f}% (>= {stop_pct:.0f}% zarar)", 1.0
+        if dd <= -(stop_pct * 1.5):  # cok derin zarar -> kosulsuz cik
+            return "SAT", f"STOP (derin): girise gore {dd:+.0f}%", 1.0
+        if dd <= -(stop_pct + buf):
+            if dir_score <= 0:
+                return "SAT", f"STOP: {dd:+.0f}% (>= {stop_pct + buf:.0f}%) ve BTC sinyali aleyhte", 1.0
+            return ("PARCALI_SAT",
+                    f"Fiyat stop seviyesinde ({dd:+.0f}%) ama BTC sinyali hala lehte — "
+                    f"feed/spread olabilir, Midas'tan teyit et & parçalı azalt", part)
 
     # 2) Sert ters sinyal -> tam cikis
     if dir_score <= -sig_thr:

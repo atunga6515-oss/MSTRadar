@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
-                  alpaca_latest_prices, fetch_klines, normalize_ohlc, mtf_score,
+                  alpaca_latest_prices, alpaca_quotes, fetch_klines, normalize_ohlc, mtf_score,
                   forecast_cone, empirical_up_probability, regime_from, holding_advice,
                   weekend_state, weekend_override)
 
@@ -67,6 +67,35 @@ def live_prices(symbols):
             if s in d and not d[s].empty:
                 px[s] = float(d[s]['Close'].iloc[-1])
     return px
+
+
+@st.cache_data(ttl=30)
+def etf_quotes(symbols):
+    """Her sembol icin {price, bid, ask, ts, source}. Once Alpaca, eksigi yfinance."""
+    q = dict(alpaca_quotes(list(symbols)))
+    missing = [s for s in symbols if s not in q]
+    if missing:
+        d = load_yf(missing, period="1d", interval="5m")
+        for s in missing:
+            if s in d and not d[s].empty:
+                ts = d[s].index[-1]
+                q[s] = {"price": float(d[s]['Close'].iloc[-1]), "bid": None, "ask": None,
+                        "ts": ts.isoformat() if hasattr(ts, "isoformat") else None,
+                        "source": "yfinance (~15dk gecikmeli)"}
+    return q
+
+
+def quote_age(ts_iso):
+    """ISO zaman damgasindan 'HH:MM (N dk once)' uretir."""
+    if not ts_iso:
+        return ""
+    try:
+        t = pd.to_datetime(ts_iso, utc=True)
+        age_min = (pd.Timestamp.now(tz="UTC") - t).total_seconds() / 60
+        tr = t.tz_convert("Europe/Istanbul").strftime("%H:%M")
+        return f"{tr} ({age_min:.0f} dk önce)" if age_min < 600 else f"{tr}"
+    except Exception:
+        return ""
 
 
 # --- Coklu zaman dilimi (MTF) veri toplayicilari ---
@@ -347,7 +376,24 @@ with tabs[3]:
     bull = settings.list("ASSETS_BULL")
     bear = settings.list("ASSETS_BEAR")
     all_assets = bull + bear
-    live_now = live_prices(all_assets)
+    quotes = etf_quotes(all_assets)
+    live_now = {s: q["price"] for s, q in quotes.items() if q.get("price")}
+
+    # Fiyat kaynağı + zaman + bid/ask (hangi sayıyı neden gördüğün net olsun)
+    qrows = []
+    for s in all_assets:
+        q = quotes.get(s, {})
+        qrows.append({
+            "ETF": s,
+            "Fiyat": f"${q['price']:.2f}" if q.get("price") else "–",
+            "Bid/Ask": (f"{q['bid']:.2f} / {q['ask']:.2f}" if q.get("bid") and q.get("ask") else "–"),
+            "Kaynak": q.get("source", "–"),
+            "Zaman": quote_age(q.get("ts")),
+        })
+    st.dataframe(pd.DataFrame(qrows), use_container_width=True, hide_index=True)
+    st.caption("⚠️ Bu fiyatlar **gösterge** (Alpaca = IEX tek borsa; düşük hacimli ETF'lerde "
+               "Midas'tan sapabilir). **Emirde, P/L ve stopta Midas'ın canlı fiyatını esas al.** "
+               "Geniş bid/ask veya eski zaman = fiyata güvenme.")
 
     # Hafta sonu koruması durumu
     wstate = weekend_state(datetime.now(timezone.utc), settings.f("WEEKEND_FLAT_MIN") or 20,
@@ -476,7 +522,7 @@ with tabs[4]:
                 "ALERT_COOLDOWN_HOURS", "ATR_STOP_MULT", "MAX_HOLD_HOURS",
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
-                "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT",
+                "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT", "STOP_BUFFER_PCT",
                 "WEEKEND_FLAT", "WEEKEND_FLAT_MIN", "WEEKEND_NOENTRY_MIN",
                 "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING"]
     with st.form("config_form"):
