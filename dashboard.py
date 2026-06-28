@@ -467,17 +467,22 @@ with tabs[3]:
             pl = ((live - h["entry_price"]) / h["entry_price"] * 100) if (live and h["entry_price"]) else None
             badge = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT", "PARCALI_SAT": "🟠 PARÇALI SAT",
                      "SAT": "🔴 SAT", "—": "⚪ —"}[advice]
-            cc = st.columns([3, 2, 2, 2, 2])
+            cc = st.columns([3, 1.4, 1.8, 1.6, 1.6, 1.6])
             cc[0].markdown(f"**{qty:,.0f} {asset}**  \nGiriş ${h['entry_price']:.2f}"
-                           + (f" · Canlı ${live:.2f}" if live else ""))
+                           + (f" · Canlı ${live:.2f}" if live else " · canlı yok"))
             cc[1].metric("P/L", f"{pl:+.1f}%" if pl is not None else "–")
             cc[2].markdown(f"### {badge}")
-            if cc[3].button("Parçalı Sat", key=f"ps{h['id']}", disabled=not live):
-                sell_q = qty * ((settings.f("PARTIAL_SELL_PCT") or 33) / 100.0)
-                db.partial_sell(h["id"], sell_q, live, int(datetime.now(timezone.utc).timestamp() * 1000))
+            # Satış fiyatı: varsayılan canlı, yoksa giriş — istersen Midas'taki fiyatı yaz
+            sell_px = cc[3].number_input("Satış $", min_value=0.0,
+                                         value=round(float(live or h["entry_price"]), 2),
+                                         step=0.1, key=f"px{h['id']}")
+            pct = settings.f("PARTIAL_SELL_PCT") or 33
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            if cc[4].button(f"Parçalı Sat %{pct:.0f}", key=f"ps{h['id']}", disabled=sell_px <= 0):
+                db.partial_sell(h["id"], qty * (pct / 100.0), sell_px, now_ms)
                 st.cache_data.clear(); st.rerun()
-            if cc[4].button("Tümünü Sat", key=f"cl{h['id']}", disabled=not live):
-                db.close_holding(h["id"], live, int(datetime.now(timezone.utc).timestamp() * 1000))
+            if cc[5].button("🔴 Tümünü Sat", key=f"cl{h['id']}", disabled=sell_px <= 0):
+                db.close_holding(h["id"], sell_px, now_ms)
                 st.cache_data.clear(); st.rerun()
             st.caption(f"📋 {reason}")
             st.divider()
