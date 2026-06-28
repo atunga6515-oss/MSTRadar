@@ -186,8 +186,8 @@ top[0].metric("BTC", f"${last_price:,.0f}" if last_price else "-")
 top[1].metric("ABD Piyasasi", {"OPEN": "🟢 ACIK", "PRE": "🟡 PRE-MKT",
                                "AFTER": "🟡 AFTER", "CLOSED": "🔴 KAPALI"}[market])
 top[2].metric("Bot Durumu", "⏸️ DURDU" if paused else "▶️ AKTIF")
-open_pos = db.get_open_position()
-top[3].metric("Acik Pozisyon", open_pos["direction"] if open_pos else "Yok")
+n_holdings = len(db.get_open_holdings())
+top[3].metric("Portföyümde", f"{n_holdings} pozisyon" if n_holdings else "Boş")
 if top[4].button("🔄 Yenile"):
     st.cache_data.clear()
     st.rerun()
@@ -234,14 +234,13 @@ with tabs[0]:
                                  line=dict(color="teal", width=1)), row=2, col=1)
         fig.add_hline(y=70, line=dict(color="red", width=0.5), row=2, col=1)
         fig.add_hline(y=30, line=dict(color="green", width=0.5), row=2, col=1)
-        # Sinyal isaretleri
-        sig = db.get_signals_df(200)
+        # Tavsiye işaretleri (AL/EKLE = yeşil ▲, SAT/PARÇALI = kırmızı ▼)
+        sig = db.get_signals_df(300)
         if not sig.empty:
-            sig = sig[sig['asset_target'].isin(settings.list("ASSETS_BULL"))]
             sig['dt'] = pd.to_datetime(sig['timestamp'], unit='ms', utc=True)
-            buys = sig[sig['signal_type'] == 'BUY']
-            sells = sig[sig['signal_type'] == 'SELL']
-            fig.add_trace(go.Scatter(x=buys['dt'], y=buys['btc_price'], mode='markers', name='AL',
+            buys = sig[sig['signal_type'].isin(['AL', 'EKLE', 'BUY'])]
+            sells = sig[sig['signal_type'].isin(['SAT', 'PARCALI_SAT', 'SELL'])]
+            fig.add_trace(go.Scatter(x=buys['dt'], y=buys['btc_price'], mode='markers', name='AL/EKLE',
                                      marker=dict(symbol='triangle-up', color='green', size=11)), row=1, col=1)
             fig.add_trace(go.Scatter(x=sells['dt'], y=sells['btc_price'], mode='markers', name='SAT',
                                      marker=dict(symbol='triangle-down', color='red', size=11)), row=1, col=1)
@@ -524,7 +523,7 @@ with tabs[4]:
     st.caption("Degisiklikler worker'in bir sonraki dongusunde otomatik uygulanir.")
     cfg = db.get_config()
     editable = ["SIGNAL_SCORE_THRESHOLD", "WATCH_SCORE_THRESHOLD", "ADX_MIN",
-                "ALERT_COOLDOWN_HOURS", "ATR_STOP_MULT", "MAX_HOLD_HOURS",
+                "ALERT_COOLDOWN_HOURS",
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
                 "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT", "STOP_BUFFER_PCT",

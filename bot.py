@@ -315,11 +315,11 @@ class TradingEngine:
         # Kullanicinin ELDEKI pozisyonuna gore kademeli tavsiye + kisisel bildirim
         rsi_val = float(last_candle['rsi']) if pd.notna(last_candle['rsi']) else None
         self._advise(ts, current_price, action, is_watch, score, regime, ci_val, gate_reason,
-                     mstr, etf_prices, holdings, rsi_val, macro_trend, force_alert)
+                     mstr, etf_prices, holdings, rsi_val, macro_trend, force_alert, snapshot, gap_msg)
 
     # ---- kullanici portfoyune gore kademeli tavsiye ----
     def _advise(self, ts, btc_price, action, is_watch, score, regime, ci_val, gate_reason,
-                mstr, etf_prices, holdings, rsi, macro_trend, force_alert):
+                mstr, etf_prices, holdings, rsi, macro_trend, force_alert, snapshot=None, gap_msg=""):
         settings = self.settings
         bull = settings.list("ASSETS_BULL")
         bear = settings.list("ASSETS_BEAR")
@@ -332,7 +332,7 @@ class TradingEngine:
                                    settings.f("WEEKEND_NOENTRY_MIN") or 90)
         wk_override = weekend_override(wstate)
 
-        lines, sig_parts = [], []
+        lines, sig_parts, records = [], [], []
         for h in holdings:
             asset = h["asset"]
             kind = h["kind"] or ("BULL" if asset in bull else "BEAR")
@@ -345,6 +345,7 @@ class TradingEngine:
             else:
                 advice, reason, frac = holding_advice(kind, score, regime, mstr_ok, rsi,
                                                       live, h["entry_price"], settings)
+            records.append((asset, advice))
             pl = f"  (P/L {(live - h['entry_price']) / h['entry_price'] * 100:+.1f}%)" \
                  if (live and h["entry_price"]) else ""
             emoji = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT",
@@ -365,6 +366,7 @@ class TradingEngine:
                 buy = bull if action == "BULLISH_SETUP" else bear
                 flat_reco = ("AL", buy)
                 sig_parts.append("FLAT:AL:" + ",".join(buy))
+                records = [(x, "AL") for x in buy]
             else:
                 sig_parts.append("FLAT:BEKLE")
                 if wstate and not gate_reason:
@@ -383,11 +385,17 @@ class TradingEngine:
             logger.info(f"Sadece TUT/BEKLE — bildirim atlandi ({sig}).")
             return
 
+        # Tavsiye gecmisini kaydet (Sinyaller sekmesi + grafik oklari icin)
+        if snapshot is not None:
+            for asset, adv in records:
+                if adv in ("SAT", "PARCALI_SAT", "EKLE", "AL"):
+                    self.db.insert_signal(ts, asset, adv, btc_price, snapshot)
+
         self._send_advice(lines, flat_reco, holdings, btc_price, score, regime,
-                          gate_reason, mstr, macro_trend)
+                          gate_reason, mstr, macro_trend, gap_msg)
 
     def _send_advice(self, lines, flat_reco, holdings, btc_price, score, regime,
-                     gate_reason, mstr, macro_trend):
+                     gate_reason, mstr, macro_trend, gap_msg=""):
         regime_tr = {"TREND": "TREND (yonlu)", "CHOP": "CHOP (yatay-riskli)",
                      "ZAYIF": "ZAYIF (belirsiz)"}.get(regime, regime)
         market_tr = {"OPEN": "ACIK", "PRE": "PRE-MARKET", "AFTER": "AFTER-HOURS",
@@ -407,24 +415,13 @@ class TradingEngine:
                     f"Elin boş. 🟡 *BEKLE* — net/teyitli sinyal yok"
                     + (f"\n   ({gate_reason})" if gate_reason else "."))
 
-        msg = (f"{body}\n\n"
+        gap_line = f"\n{gap_msg}" if gap_msg else ""
+        msg = (f"{body}{gap_line}\n\n"
                f"📈 Skor: {score:+.0f}/100  |  🧭 Rejim: {regime_tr}\n"
                f"🏛️ MSTR yön: {mstr_tr}  |  ABD: {market_tr}\n"
                f"📊 BTC: ${btc_price:,.0f}  |  Trend(4S): {macro_tr}\n"
                f"_İşlemi sen yaparsın; bot otomatik emir göndermez._")
         self.notifier.send_message(msg)
-
-    def _send_status_report(self, price, score, adx_val, macro_trend, last_candle, sentiment, thr):
-        fr = sentiment.get("funding_rate")
-        self.notifier.send_message(
-            f"📊 *DURUM RAPORU* 📊\n\n"
-            f"BTC: ${price:,.2f}\n"
-            f"Skor: {score:+.0f}/100 (esik ±{thr:.0f})\n"
-            f"ADX: {adx_val:.0f}  |  Makro (4S): {macro_trend}\n"
-            f"RSI (5dk): {last_candle['rsi']:.1f}\n"
-            f"ABD Piyasasi: {us_market_status()}\n"
-            f"Funding: {('%.4f%%' % (fr*100)) if fr is not None else 'N/A'}\n\n"
-            f"Sistem arka planda calisiyor.")
 
     def _gap_play(self, df: pd.DataFrame, current_price: float) -> str:
         now_tr = datetime.now(TR_TZ)
