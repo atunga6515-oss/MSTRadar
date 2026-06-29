@@ -727,9 +727,9 @@ def robinhood_quote(ticker: str) -> Optional[Dict]:
         return None
 
 
-def robinhood_btc_price(pair_id: Optional[str] = None) -> Optional[float]:
-    """Robinhood crypto BTC-USD fiyati (gosterim/karsilastirma icin).
-    Not: crypto endpoint giris (auth) isteyebilir; isterse None doner."""
+def robinhood_btc_quote(pair_id: Optional[str] = None) -> Optional[Dict]:
+    """Robinhood crypto BTC-USD: {price, bid, ask}. 7/24 -> mark_price ana fiyat.
+    Not: crypto'da bid/ask spread'i genis olabilir (Robinhood markup'i)."""
     pair_id = pair_id or os.getenv("ROBINHOOD_BTC_PAIR_ID", "3d961844-d360-45fc-989b-f6fca761d511")
     try:
         import requests
@@ -738,12 +738,21 @@ def robinhood_btc_price(pair_id: Optional[str] = None) -> Optional[float]:
         if r.status_code != 200:
             return None
         d = r.json()
-        for k in ("mark_price", "last_trade_price", "ask_price", "bid_price"):
-            if d.get(k):
-                return float(d[k])
-        return None
+        price = d.get("mark_price") or d.get("last_trade_price")
+        if not price:
+            return None
+        return {
+            "price": float(price),
+            "bid": float(d["bid_price"]) if d.get("bid_price") else None,
+            "ask": float(d["ask_price"]) if d.get("ask_price") else None,
+        }
     except Exception:
         return None
+
+
+def robinhood_btc_price(pair_id: Optional[str] = None) -> Optional[float]:
+    q = robinhood_btc_quote(pair_id)
+    return q["price"] if q else None
 
 
 def robinhood_quotes(symbols) -> Dict[str, Dict]:

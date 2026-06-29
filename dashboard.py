@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
                   alpaca_latest_prices, alpaca_quotes, alpaca_snapshot, leverage_map,
-                  synthetic_etf_prices, robinhood_quotes, robinhood_quote, robinhood_btc_price,
+                  synthetic_etf_prices, robinhood_quotes, robinhood_quote, robinhood_btc_quote,
                   fetch_klines, normalize_ohlc, mtf_score,
                   forecast_cone, empirical_up_probability, regime_from, holding_advice,
                   weekend_state, weekend_override)
@@ -132,8 +132,8 @@ def rh_quotes(symbols):
 
 @st.cache_data(ttl=20)
 def rh_btc():
-    """Robinhood BTC fiyati (gosterim/karsilastirma; None ise giris gerekiyordur)."""
-    return robinhood_btc_price()
+    """Robinhood BTC quote {price,bid,ask} (gosterim; None ise giris gerekiyordur)."""
+    return robinhood_btc_quote()
 
 
 def quote_age(ts_iso):
@@ -271,7 +271,11 @@ with tabs[0]:
     btc_rh = rh_btc()
     rcols = st.columns(len(rh_syms) + 2)
     rcols[0].metric("BTC · Binance", f"${last_price:,.0f}" if last_price else "-", "sinyal kaynağı")
-    rcols[1].metric("BTC · Robinhood", f"${btc_rh:,.0f}" if btc_rh else "giriş gerekli")
+    btc_sub = None
+    if btc_rh and btc_rh.get("bid") and btc_rh.get("ask"):
+        btc_sub = f"bid {btc_rh['bid']:,.0f} / ask {btc_rh['ask']:,.0f}"
+    rcols[1].metric("BTC · Robinhood",
+                    f"${btc_rh['price']:,.0f}" if btc_rh else "giriş gerekli", btc_sub)
     for i, sym in enumerate(rh_syms):
         qd = rhq.get(sym, {})
         sub = ""
