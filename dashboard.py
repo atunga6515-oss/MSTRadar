@@ -20,7 +20,7 @@ from plotly.subplots import make_subplots
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
                   alpaca_latest_prices, alpaca_quotes, alpaca_snapshot, leverage_map,
                   synthetic_etf_prices, robinhood_quotes, robinhood_quote, robinhood_btc_quote,
-                  fetch_klines, normalize_ohlc, mtf_score,
+                  robinhood_historicals, fetch_klines, normalize_ohlc, mtf_score,
                   forecast_cone, empirical_up_probability, regime_from, holding_advice,
                   weekend_state, weekend_override)
 
@@ -136,6 +136,18 @@ def rh_btc():
     return robinhood_btc_quote()
 
 
+@st.cache_data(ttl=600)
+def rh_daily(symbol):
+    """Robinhood gunluk historicals (1 ay) -> trend grafigi. Yedek yfinance."""
+    d = robinhood_historicals(symbol, "day", "month") if settings.b("USE_ROBINHOOD_PRICE") else pd.DataFrame()
+    if d.empty and HAS_YF:
+        try:
+            d = normalize_ohlc(yf.Ticker(symbol).history(period="1mo", interval="1d"))
+        except Exception:
+            d = pd.DataFrame()
+    return d
+
+
 def quote_age(ts_iso):
     """ISO zaman damgasindan 'HH:MM (N dk once)' uretir."""
     if not ts_iso:
@@ -166,29 +178,35 @@ def mtf_btc():
     return out
 
 
+def _hist(symbol, interval, span, yf_period, yf_interval):
+    """Once Robinhood historicals (gercek hacim), yoksa yfinance."""
+    df = robinhood_historicals(symbol, interval, span) if settings.b("USE_ROBINHOOD_PRICE") else pd.DataFrame()
+    if df.empty and HAS_YF:
+        try:
+            df = normalize_ohlc(yf.Ticker(symbol).history(period=yf_period, interval=yf_interval))
+        except Exception:
+            df = pd.DataFrame()
+    return df
+
+
 @st.cache_data(ttl=600)
 def mtf_equity(symbol):
-    """MSTR/ETF icin 4 zaman dilimi (yfinance). Intraday seans disi bosluklu olabilir."""
+    """MSTR/ETF icin 4 zaman dilimi — Robinhood historicals (gercek hacim), yedek yfinance."""
     out = {}
-    if not HAS_YF:
-        return out
-    try:
-        h1 = normalize_ohlc(yf.Ticker(symbol).history(period="60d", interval="1h"))
-        if not h1.empty:
-            out["Saatlik"] = mtf_score(h1)
-            h12 = h1.set_index("timestamp_dt").resample("12h").agg(
-                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-            ).dropna().reset_index()
-            if len(h12) >= 55:
-                out["12 Saat"] = mtf_score(h12)
-        d1 = normalize_ohlc(yf.Ticker(symbol).history(period="2y", interval="1d"))
-        if not d1.empty:
-            out["Gunluk"] = mtf_score(d1)
-        w1 = normalize_ohlc(yf.Ticker(symbol).history(period="5y", interval="1wk"))
-        if not w1.empty:
-            out["Haftalik"] = mtf_score(w1)
-    except Exception:
-        pass
+    h1 = _hist(symbol, "hour", "3month", "60d", "1h")
+    d1 = _hist(symbol, "day", "year", "2y", "1d")
+    w1 = _hist(symbol, "week", "5year", "5y", "1wk")
+    if not h1.empty:
+        out["Saatlik"] = mtf_score(h1)
+        h12 = h1.set_index("timestamp_dt").resample("12h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna().reset_index()
+        if len(h12) >= 55:
+            out["12 Saat"] = mtf_score(h12)
+    if not d1.empty:
+        out["Gunluk"] = mtf_score(d1)
+    if not w1.empty:
+        out["Haftalik"] = mtf_score(w1)
     return out
 
 
@@ -321,11 +339,11 @@ with tabs[0]:
         fig.update_layout(height=620, xaxis_rangeslider_visible=False, margin=dict(t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    # MSTR + ETF: fiyat ROBINHOOD'dan (üst panelle tutarlı), 5g mini grafik trend için yfinance
+    # MSTR + ETF: fiyat + 30g trend grafiği — hepsi ROBINHOOD'dan (gerçek hacim)
     st.subheader("MSTR & ETF'ler (baz riski takibi)")
     underlying = settings.s("UNDERLYING") or "MSTR"
     syms = [underlying] + settings.list("ASSETS_BULL") + settings.list("ASSETS_BEAR")
-    data = load_yf(syms) if HAS_YF else {}
+    hist = {s: rh_daily(s) for s in syms}
     cols = st.columns(min(len(syms), 4) or 1)
     for i, s in enumerate(syms):
         with cols[i % len(cols)]:
@@ -334,21 +352,21 @@ with tabs[0]:
             if price:
                 chg = f"{(price/pc-1)*100:+.1f}% (gün)" if pc else None
                 st.metric(s, f"${price:.2f}", chg)   # Robinhood (üst panelle aynı)
-            elif s in data and not data[s].empty:
-                st.metric(s, f"${data[s]['Close'].iloc[-1]:.2f}", "yfinance")
             else:
                 st.metric(s, "veri yok")
-            if s in data and not data[s].empty:
-                st.line_chart(data[s]['Close'], height=140)
+            d = hist.get(s, pd.DataFrame())
+            if not d.empty:
+                st.line_chart(d.set_index("timestamp_dt")["close"].tail(30), height=140)
     # BTC-MSTR korelasyonu (baz riski göstergesi)
-    if underlying in data and not df.empty:
+    und_d = hist.get(underlying, pd.DataFrame())
+    if not und_d.empty and not df.empty:
         try:
-            m = data[underlying]['Close'].pct_change().dropna()
-            b = df.set_index('timestamp_dt')['close'].resample('15min').last().pct_change().dropna()
-            j = pd.concat([m.tz_convert('UTC'), b], axis=1).dropna()
+            m = und_d.set_index("timestamp_dt")["close"].pct_change().dropna()
+            b = df.set_index('timestamp_dt')['close'].resample('1D').last().pct_change().dropna()
+            j = pd.concat([m, b], axis=1).dropna()
             if len(j) > 10:
                 corr = j.iloc[:, 0].corr(j.iloc[:, 1])
-                st.caption(f"BTC ↔ {underlying} 15dk getiri korelasyonu (5g): **{corr:.2f}** "
+                st.caption(f"BTC ↔ {underlying} günlük getiri korelasyonu: **{corr:.2f}** "
                            f"— 1'e yakin = ETF sinyali BTC ile uyumlu; dusukse baz riski yuksek.")
         except Exception:
             pass

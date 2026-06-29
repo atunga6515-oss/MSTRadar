@@ -755,6 +755,32 @@ def robinhood_btc_price(pair_id: Optional[str] = None) -> Optional[float]:
     return q["price"] if q else None
 
 
+def robinhood_historicals(symbol: str, interval: str = "day", span: str = "year",
+                          bounds: str = "regular") -> pd.DataFrame:
+    """Robinhood hisse historicals -> OHLCV DataFrame (gercek hacim dahil).
+    interval: 5minute/10minute/hour/day/week  span: day/week/month/3month/year/5year
+    Bos DataFrame donerse cagiran yfinance'a duser."""
+    try:
+        import requests
+        r = requests.get(f"https://api.robinhood.com/marketdata/historicals/{symbol}/",
+                         params={"interval": interval, "span": span, "bounds": bounds},
+                         headers=_RH_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        rows = r.json().get("historicals") or r.json().get("data_points") or []
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame([{
+            "timestamp_dt": pd.to_datetime(x["begins_at"], utc=True),
+            "open": float(x["open_price"]), "high": float(x["high_price"]),
+            "low": float(x["low_price"]), "close": float(x["close_price"]),
+            "volume": float(x.get("volume") or 0),
+        } for x in rows])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def robinhood_quotes(symbols) -> Dict[str, Dict]:
     return {s: q for s in symbols if (q := robinhood_quote(s))}
 

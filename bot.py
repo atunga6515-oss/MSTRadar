@@ -22,6 +22,7 @@ from core import (
     normalize_ohlc, mtf_score, regime_from, holding_advice,
     weekend_state, weekend_override,
     alpaca_snapshot, leverage_map, synthetic_etf_prices, robinhood_prices, robinhood_quote,
+    robinhood_historicals,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,19 +168,21 @@ class DataFetcher:
 
     def fetch_underlying_score(self) -> Optional[Dict]:
         """MSTR (UNDERLYING) icin kisa vadeli yon skoru — tam sinyal teyidi icin.
-        Once 15dk intraday (seans), yoksa gunluk. Veri yoksa None (teyit atlanir)."""
+        Once Robinhood historicals (saatlik), yoksa yfinance. Veri yoksa None."""
         sym = self.settings.s("UNDERLYING") or "MSTR"
-        try:
-            df = normalize_ohlc(yf.Ticker(sym).history(period="5d", interval="15m"))
-            if df.empty or len(df) < 55:
-                df = normalize_ohlc(yf.Ticker(sym).history(period="6mo", interval="1d"))
-            if df.empty or len(df) < 55:
-                return None
-            score, label, _ = mtf_score(df)
-            return {"score": score, "label": label}
-        except Exception as e:
-            logger.error(f"MSTR teyit verisi alinamadi: {e}")
+        df = robinhood_historicals(sym, "hour", "3month") if self.settings.b("USE_ROBINHOOD_PRICE") else pd.DataFrame()
+        if df.empty or len(df) < 55:
+            try:
+                df = normalize_ohlc(yf.Ticker(sym).history(period="5d", interval="15m"))
+                if df.empty or len(df) < 55:
+                    df = normalize_ohlc(yf.Ticker(sym).history(period="6mo", interval="1d"))
+            except Exception as e:
+                logger.error(f"MSTR teyit verisi alinamadi: {e}")
+                df = pd.DataFrame()
+        if df.empty or len(df) < 55:
             return None
+        score, label, _ = mtf_score(df)
+        return {"score": score, "label": label}
 
     def fetch_futures_sentiment(self) -> Dict[str, Optional[float]]:
         out: Dict[str, Optional[float]] = {"funding_rate": None, "open_interest": None}
