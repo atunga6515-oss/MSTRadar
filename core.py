@@ -62,6 +62,8 @@ ENV_DEFAULTS = {
     "HOLDING_STOP_PCT": os.getenv("HOLDING_STOP_PCT", "15"),   # ETF girise gore bu kadar dustuyse SAT
     "PARTIAL_SELL_PCT": os.getenv("PARTIAL_SELL_PCT", "33"),   # PARCALI SAT'ta onerilen oran (%)
     "STOP_BUFFER_PCT": os.getenv("STOP_BUFFER_PCT", "1.5"),    # feed gurultusu icin stop toleransi
+    # --- Robinhood konsolide fiyat (uzatilmis saat dahil, anahtarsiz) ---
+    "USE_ROBINHOOD_PRICE": os.getenv("USE_ROBINHOOD_PRICE", "true"),
     # --- MSTR-sentetik ETF fiyati (ince/donmus ETF feed'i yerine MSTR'dan turet) ---
     "USE_SYNTHETIC_PRICE": os.getenv("USE_SYNTHETIC_PRICE", "true"),
     "BULL_LEVERAGE": os.getenv("BULL_LEVERAGE", "2"),    # MSTU/MSTX = +2x MSTR
@@ -685,6 +687,71 @@ def alpaca_snapshot(symbols) -> Dict[str, Dict]:
         return out
     except Exception:
         return {}
+
+
+_RH_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    "Accept": "application/json",
+}
+
+
+def robinhood_quote(ticker: str) -> Optional[Dict]:
+    """Robinhood'un anahtarsiz quotes endpoint'i — KONSOLIDE + UZATILMIS SAAT dahil.
+    last_extended_hours_trade_price varsa (after-hours) onu, yoksa last_trade_price'i verir.
+    Resmi/dokumante degil; kirilirsa cagiran taraf yedege duser."""
+    try:
+        import requests
+        r = requests.get(f"https://api.robinhood.com/quotes/{ticker}/",
+                         headers=_RH_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        ext, reg = d.get("last_extended_hours_trade_price"), d.get("last_trade_price")
+        price, is_ext = None, False
+        if ext and float(ext) > 0:
+            price, is_ext = float(ext), True
+        elif reg and float(reg) > 0:
+            price = float(reg)
+        if not price:
+            return None
+        return {
+            "price": price,
+            "bid": float(d["bid_price"]) if d.get("bid_price") else None,
+            "ask": float(d["ask_price"]) if d.get("ask_price") else None,
+            "prev_close": float(d["previous_close"]) if d.get("previous_close") else None,
+            "ts": d.get("updated_at"),
+            "source": "Robinhood (after-hours)" if is_ext else "Robinhood",
+        }
+    except Exception:
+        return None
+
+
+def robinhood_btc_price(pair_id: Optional[str] = None) -> Optional[float]:
+    """Robinhood crypto BTC-USD fiyati (gosterim/karsilastirma icin).
+    Not: crypto endpoint giris (auth) isteyebilir; isterse None doner."""
+    pair_id = pair_id or os.getenv("ROBINHOOD_BTC_PAIR_ID", "3d961844-d360-45fc-989b-f6fca761d511")
+    try:
+        import requests
+        r = requests.get(f"https://api.robinhood.com/marketdata/forex/quotes/{pair_id}/",
+                         headers=_RH_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        for k in ("mark_price", "last_trade_price", "ask_price", "bid_price"):
+            if d.get(k):
+                return float(d[k])
+        return None
+    except Exception:
+        return None
+
+
+def robinhood_quotes(symbols) -> Dict[str, Dict]:
+    return {s: q for s in symbols if (q := robinhood_quote(s))}
+
+
+def robinhood_prices(symbols) -> Dict[str, float]:
+    return {s: q["price"] for s, q in robinhood_quotes(symbols).items()}
 
 
 def leverage_map(settings) -> Dict[str, float]:

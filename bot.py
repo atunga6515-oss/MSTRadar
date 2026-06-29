@@ -21,7 +21,7 @@ from core import (
     f_or_none, us_market_status, is_tradeable, alpaca_latest_prices,
     normalize_ohlc, mtf_score, regime_from, holding_advice,
     weekend_state, weekend_override,
-    alpaca_snapshot, leverage_map, synthetic_etf_prices,
+    alpaca_snapshot, leverage_map, synthetic_etf_prices, robinhood_prices, robinhood_quote,
 )
 
 # ---------------------------------------------------------------------------
@@ -133,19 +133,27 @@ class DataFetcher:
         assets = self.settings.list("ASSETS_BULL") + self.settings.list("ASSETS_BEAR")
         prices: Dict[str, float] = {}
 
-        # 1) MSTR-SENTETIK (oncelikli): ETF'i likit MSTR'dan turet — ince/donmus feed sorununu asar
-        if self.settings.b("USE_SYNTHETIC_PRICE"):
+        # 0) ROBINHOOD (oncelikli): konsolide + uzatilmis saat dahil, Midas'a en yakin
+        if self.settings.b("USE_ROBINHOOD_PRICE"):
+            rh = robinhood_prices(assets)
+            if rh:
+                prices.update(rh)
+                logger.info(f"ETF fiyatlari Robinhood'dan: { {k: round(v,2) for k,v in rh.items()} }")
+
+        # 1) MSTR-SENTETIK: eksik kalanlari likit MSTR'dan turet
+        if self.settings.b("USE_SYNTHETIC_PRICE") and any(a not in prices for a in assets):
             und = self.settings.s("UNDERLYING") or "MSTR"
+            rh_m = robinhood_quote(und) if self.settings.b("USE_ROBINHOOD_PRICE") else None
             snap = alpaca_snapshot([und] + assets)
-            mstr_price = snap.get(und, {}).get("price") or self._yf_last(und, prepost=True)
-            mstr_pc = snap.get(und, {}).get("prev_close") or self._yf_prev_close(und)
-            etf_pc = {}
-            for a in assets:
-                etf_pc[a] = snap.get(a, {}).get("prev_close") or self._yf_prev_close(a)
-            prices = synthetic_etf_prices(mstr_price, mstr_pc, etf_pc, leverage_map(self.settings))
-            if prices:
+            mstr_price = (rh_m or {}).get("price") or snap.get(und, {}).get("price") or self._yf_last(und, prepost=True)
+            mstr_pc = (rh_m or {}).get("prev_close") or snap.get(und, {}).get("prev_close") or self._yf_prev_close(und)
+            etf_pc = {a: (snap.get(a, {}).get("prev_close") or self._yf_prev_close(a))
+                      for a in assets if a not in prices}
+            synth = synthetic_etf_prices(mstr_price, mstr_pc, etf_pc, leverage_map(self.settings))
+            if synth:
+                prices.update(synth)  # sadece eksikleri doldur, Robinhood'u ezme
                 logger.info(f"ETF fiyatlari MSTR-sentetik (MSTR={mstr_price}): "
-                            f"{ {k: round(v,2) for k,v in prices.items()} }")
+                            f"{ {k: round(v,2) for k,v in synth.items()} }")
 
         # 2) Eksikleri Alpaca dogrudan (gercek zamanli IEX)
         for a, p in alpaca_latest_prices([x for x in assets if x not in prices]).items():

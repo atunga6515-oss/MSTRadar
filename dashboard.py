@@ -19,7 +19,8 @@ from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
                   alpaca_latest_prices, alpaca_quotes, alpaca_snapshot, leverage_map,
-                  synthetic_etf_prices, fetch_klines, normalize_ohlc, mtf_score,
+                  synthetic_etf_prices, robinhood_quotes, robinhood_quote, robinhood_btc_price,
+                  fetch_klines, normalize_ohlc, mtf_score,
                   forecast_cone, empirical_up_probability, regime_from, holding_advice,
                   weekend_state, weekend_override)
 
@@ -92,13 +93,18 @@ def etf_quotes(symbols):
     Oncelik: MSTR-sentetik (likit MSTR'dan) -> Alpaca -> yfinance."""
     symbols = list(symbols)
     q = {}
-    # 1) MSTR-sentetik
-    if settings.b("USE_SYNTHETIC_PRICE"):
+    # 0) Robinhood (konsolide + after-hours + bid/ask) — Midas'a en yakin
+    if settings.b("USE_ROBINHOOD_PRICE"):
+        q.update(robinhood_quotes(symbols))
+    # 1) MSTR-sentetik (yalniz eksikler)
+    if settings.b("USE_SYNTHETIC_PRICE") and any(s not in q for s in symbols):
         und = settings.s("UNDERLYING") or "MSTR"
-        snap = alpaca_snapshot([und] + symbols)
-        mstr_price = snap.get(und, {}).get("price") or _yf_price(und)
-        mstr_pc = snap.get(und, {}).get("prev_close") or _yf_prevclose(und)
-        etf_pc = {s: (snap.get(s, {}).get("prev_close") or _yf_prevclose(s)) for s in symbols}
+        need = [s for s in symbols if s not in q]
+        rh_m = robinhood_quote(und) if settings.b("USE_ROBINHOOD_PRICE") else None
+        snap = alpaca_snapshot([und] + need)
+        mstr_price = (rh_m or {}).get("price") or snap.get(und, {}).get("price") or _yf_price(und)
+        mstr_pc = (rh_m or {}).get("prev_close") or snap.get(und, {}).get("prev_close") or _yf_prevclose(und)
+        etf_pc = {s: (snap.get(s, {}).get("prev_close") or _yf_prevclose(s)) for s in need}
         synth = synthetic_etf_prices(mstr_price, mstr_pc, etf_pc, leverage_map(settings))
         src = f"MSTR-sentetik (MSTR=${mstr_price:.2f})" if mstr_price else "MSTR-sentetik"
         for s, p in synth.items():
@@ -116,6 +122,18 @@ def etf_quotes(symbols):
                         "ts": ts.isoformat() if hasattr(ts, "isoformat") else None,
                         "source": "yfinance (~15dk gecikmeli)"}
     return q
+
+
+@st.cache_data(ttl=20)
+def rh_quotes(symbols):
+    """Sadece Robinhood fiyatlari (gosterim paneli icin)."""
+    return robinhood_quotes(list(symbols))
+
+
+@st.cache_data(ttl=20)
+def rh_btc():
+    """Robinhood BTC fiyati (gosterim/karsilastirma; None ise giris gerekiyordur)."""
+    return robinhood_btc_price()
 
 
 def quote_age(ts_iso):
@@ -246,6 +264,25 @@ tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller",
 # TAB 1 — Grafikler
 # ===========================================================================
 with tabs[0]:
+    # --- 📡 Robinhood Canlı Fiyatlar (Midas'a en yakın, after-hours dahil) ---
+    st.markdown("#### 📡 Robinhood Canlı Fiyatlar")
+    rh_syms = [settings.s("UNDERLYING") or "MSTR"] + settings.list("ASSETS_BULL") + settings.list("ASSETS_BEAR")
+    rhq = rh_quotes(rh_syms)
+    btc_rh = rh_btc()
+    rcols = st.columns(len(rh_syms) + 2)
+    rcols[0].metric("BTC · Binance", f"${last_price:,.0f}" if last_price else "-", "sinyal kaynağı")
+    rcols[1].metric("BTC · Robinhood", f"${btc_rh:,.0f}" if btc_rh else "giriş gerekli")
+    for i, sym in enumerate(rh_syms):
+        qd = rhq.get(sym, {})
+        sub = ""
+        if qd.get("ts"):
+            sub = ("after-hours · " if "after-hours" in (qd.get("source") or "") else "") + quote_age(qd["ts"])
+        rcols[i + 2].metric(sym, f"${qd['price']:.2f}" if qd.get("price") else "—", sub or None)
+    st.caption("ETF/MSTR ve BTC fiyatları **Robinhood**'dan (konsolide + after-hours). "
+               "BTC·Binance ise botun **sinyal hesabında** kullandığı 7/24 kaynak. "
+               "Robinhood BTC 'giriş gerekli' diyorsa crypto endpoint'i auth istiyordur (ETF'ler anahtarsız çalışıyor).")
+    st.divider()
+
     if df.empty:
         st.warning("Henuz veri yok. Once `python bot.py` ile veri biriktir.")
     else:
@@ -558,7 +595,7 @@ with tabs[4]:
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
                 "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT", "STOP_BUFFER_PCT",
-                "USE_SYNTHETIC_PRICE", "BULL_LEVERAGE", "BEAR_LEVERAGE",
+                "USE_ROBINHOOD_PRICE", "USE_SYNTHETIC_PRICE", "BULL_LEVERAGE", "BEAR_LEVERAGE",
                 "WEEKEND_FLAT", "WEEKEND_FLAT_MIN", "WEEKEND_NOENTRY_MIN",
                 "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING"]
     with st.form("config_form"):
