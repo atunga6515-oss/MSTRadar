@@ -507,16 +507,14 @@ with tabs[3]:
 # ===========================================================================
 with tabs[4]:
     st.subheader("Hizli Kontroller")
-    b = st.columns(4)
+    b = st.columns(3)
     if b[0].button("▶️ Devam et" if paused else "⏸️ Durdur"):
         db.push_command("resume" if paused else "pause")
         st.success("Komut gonderildi (worker birkac sn icinde uygular).")
     if b[1].button("⚡ Simdi analiz et"):
         db.push_command("trigger")
         st.success("Manuel analiz komutu gonderildi.")
-    if b[2].button("🔚 Acik pozisyonu kapat", disabled=open_pos is None):
-        db.push_command("close")
-        st.success("Pozisyon kapatma komutu gonderildi.")
+    b[2].caption("Pozisyon satışı artık **Portföyüm** sekmesinden yapılır.")
 
     st.divider()
     st.subheader("Ayarlar (config)")
