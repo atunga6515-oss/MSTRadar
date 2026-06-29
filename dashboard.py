@@ -543,7 +543,19 @@ with tabs[3]:
             gr = state.get("gate_reason")
             st.info(f"Elin boş. 🟡 Net/teyitli sinyal yok — **BEKLE**" + (f" ({gr})" if gr else "."))
     else:
-        st.markdown("**Açık pozisyonların + bot tavsiyesi:**")
+        # --- Portföy TOPLAMI ---
+        tot_cost = sum(h["qty"] * h["entry_price"] for h in holds)
+        tot_val = sum(h["qty"] * (live_now.get(h["asset"]) or h["entry_price"]) for h in holds)
+        tot_pl = tot_val - tot_cost
+        tm = st.columns(4)
+        tm[0].metric("💵 Toplam Maliyet", f"${tot_cost:,.0f}")
+        tm[1].metric("📊 Güncel Değer", f"${tot_val:,.0f}")
+        tm[2].metric("💰 Toplam Kâr/Zarar", f"${tot_pl:+,.0f}",
+                     f"{(tot_pl/tot_cost*100) if tot_cost else 0:+.1f}%")
+        tm[3].metric("Pozisyon", f"{len(holds)}")
+        st.divider()
+
+        pct = settings.f("PARTIAL_SELL_PCT") or 33
         for h in holds:
             asset, kind, qty = h["asset"], h["kind"], h["qty"]
             live = live_now.get(asset)
@@ -558,27 +570,37 @@ with tabs[3]:
                                                       s_rsi, live, h["entry_price"], settings)
             else:
                 advice, reason, frac = "—", "worker hesabı bekleniyor (≤5 dk)", None
-            pl = ((live - h["entry_price"]) / h["entry_price"] * 100) if (live and h["entry_price"]) else None
             badge = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT", "PARCALI_SAT": "🟠 PARÇALI SAT",
                      "SAT": "🔴 SAT", "—": "⚪ —"}[advice]
-            cc = st.columns([3, 1.4, 1.8, 1.6, 1.6, 1.6])
-            cc[0].markdown(f"**{qty:,.0f} {asset}**  \nGiriş ${h['entry_price']:.2f}"
-                           + (f" · Canlı ${live:.2f}" if live else " · canlı yok"))
-            cc[1].metric("P/L", f"{pl:+.1f}%" if pl is not None else "–")
-            cc[2].markdown(f"### {badge}")
-            # Satış fiyatı: varsayılan canlı, yoksa giriş — istersen Midas'taki fiyatı yaz
-            sell_px = cc[3].number_input("Satış $", min_value=0.0,
-                                         value=round(float(live or h["entry_price"]), 2),
-                                         step=0.1, key=f"px{h['id']}")
-            pct = settings.f("PARTIAL_SELL_PCT") or 33
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            if cc[4].button(f"Parçalı Sat %{pct:.0f}", key=f"ps{h['id']}", disabled=sell_px <= 0):
-                db.partial_sell(h["id"], qty * (pct / 100.0), sell_px, now_ms)
-                st.cache_data.clear(); st.rerun()
-            if cc[5].button("🔴 Tümünü Sat", key=f"cl{h['id']}", disabled=sell_px <= 0):
-                db.close_holding(h["id"], sell_px, now_ms)
-                st.cache_data.clear(); st.rerun()
-            st.caption(f"📋 {reason}")
+            cost = qty * h["entry_price"]
+            value = (qty * live) if live else None
+            profit = (value - cost) if value is not None else None
+            plp = (profit / cost * 100) if (profit is not None and cost) else None
+
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                st.markdown(f"### {qty:,.0f} {asset} → {badge}")
+                txt = f"💵 **Maliyet:** ${cost:,.0f}  ·  {qty:,.0f} × ${h['entry_price']:.2f}\n\n"
+                if value is not None:
+                    sign = "🟢" if profit >= 0 else "🔴"
+                    txt += (f"📊 **Güncel Değer:** ${value:,.0f}  ·  canlı ${live:.2f}\n\n"
+                            f"{sign} **Kâr/Zarar:** ${profit:+,.0f}  ({plp:+.1f}%)")
+                else:
+                    txt += "📊 Canlı fiyat yok"
+                st.markdown(txt)
+                st.caption(f"📋 {reason}")
+            with c2:
+                sell_px = st.number_input("Satış fiyatı ($) — Midas'taki fiyatı yaz", min_value=0.0,
+                                          value=round(float(live or h["entry_price"]), 2),
+                                          step=0.1, key=f"px{h['id']}")
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                bb = st.columns(2)
+                if bb[0].button(f"Parçalı %{pct:.0f}", key=f"ps{h['id']}", disabled=sell_px <= 0):
+                    db.partial_sell(h["id"], qty * (pct / 100.0), sell_px, now_ms)
+                    st.cache_data.clear(); st.rerun()
+                if bb[1].button("🔴 Tümünü Sat", key=f"cl{h['id']}", disabled=sell_px <= 0):
+                    db.close_holding(h["id"], sell_px, now_ms)
+                    st.cache_data.clear(); st.rerun()
             st.divider()
 
     # --- Gerçekleşen K/Z (kapanan pozisyonlar) ---
@@ -588,14 +610,22 @@ with tabs[3]:
         realized = closed['pnl_abs'].sum()
         wins = (closed['pnl_abs'] > 0).sum()
         st.markdown("---")
+        st.subheader("Kapanan Pozisyonlar (gerçekleşen kâr/zarar)")
         mm = st.columns(3)
-        mm[0].metric("Gerçekleşen K/Z", f"${realized:+,.0f}")
+        mm[0].metric("💰 Gerçekleşen Toplam K/Z", f"${realized:+,.0f}")
         mm[1].metric("Kapanan işlem", len(closed))
         mm[2].metric("Kazanç oranı", f"%{wins/len(closed)*100:.0f}")
-        closed['giris'] = closed['entry_ts'].apply(fmt_ts)
-        closed['cikis'] = closed['exit_ts'].apply(fmt_ts)
-        st.dataframe(closed[['giris', 'cikis', 'asset', 'qty', 'entry_price', 'exit_price', 'pnl_abs', 'note']],
-                     use_container_width=True, height=240)
+        closed['Giriş'] = closed['entry_ts'].apply(fmt_ts)
+        closed['Çıkış'] = closed['exit_ts'].apply(fmt_ts)
+        closed['Maliyet ($)'] = (closed['qty'] * closed['entry_price']).round(0)
+        closed['Satış ($)'] = (closed['qty'] * closed['exit_price']).round(0)
+        closed['K/Z ($)'] = closed['pnl_abs'].round(0)
+        closed['K/Z (%)'] = ((closed['exit_price'] / closed['entry_price'] - 1) * 100).round(1)
+        st.dataframe(
+            closed[['Giriş', 'Çıkış', 'asset', 'qty', 'entry_price', 'exit_price',
+                    'Maliyet ($)', 'Satış ($)', 'K/Z ($)', 'K/Z (%)']].rename(
+                columns={'asset': 'ETF', 'qty': 'Adet', 'entry_price': 'Alış', 'exit_price': 'Satış fiyatı'}),
+            use_container_width=True, height=240)
 
 # ===========================================================================
 # TAB 4 — Yonetim
