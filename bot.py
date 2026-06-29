@@ -170,7 +170,7 @@ class DataFetcher:
         """MSTR (UNDERLYING) icin kisa vadeli yon skoru — tam sinyal teyidi icin.
         Once Robinhood historicals (saatlik), yoksa yfinance. Veri yoksa None."""
         sym = self.settings.s("UNDERLYING") or "MSTR"
-        df = robinhood_historicals(sym, "hour", "3month") if self.settings.b("USE_ROBINHOOD_PRICE") else pd.DataFrame()
+        df = robinhood_historicals(sym, "hour", "month") if self.settings.b("USE_ROBINHOOD_PRICE") else pd.DataFrame()
         if df.empty or len(df) < 55:
             try:
                 df = normalize_ohlc(yf.Ticker(sym).history(period="5d", interval="15m"))
@@ -370,7 +370,7 @@ class TradingEngine:
                                    settings.f("WEEKEND_NOENTRY_MIN") or 90)
         wk_override = weekend_override(wstate)
 
-        lines, sig_parts, records = [], [], []
+        lines, sig_parts, records, adv_map = [], [], [], {}
         for h in holdings:
             asset = h["asset"]
             kind = h["kind"] or ("BULL" if asset in bull else "BEAR")
@@ -384,6 +384,9 @@ class TradingEngine:
                 advice, reason, frac = holding_advice(kind, score, regime, mstr_ok, rsi,
                                                       live, h["entry_price"], settings)
             records.append((asset, advice))
+            pl_pct = ((live - h["entry_price"]) / h["entry_price"] * 100) if (live and h["entry_price"]) else None
+            adv_map[asset] = {"advice": advice, "reason": reason, "frac": frac,
+                              "live": live, "pl": pl_pct}
             pl = f"  (P/L {(live - h['entry_price']) / h['entry_price'] * 100:+.1f}%)" \
                  if (live and h["entry_price"]) else ""
             emoji = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT",
@@ -411,6 +414,17 @@ class TradingEngine:
                     gate_reason = {"FLATTEN": "hafta sonu yaklaşıyor, yeni giriş yok",
                                    "NO_ENTRY": "Cuma kapanışı yakın, yeni giriş yok",
                                    "WEEKEND": "hafta sonu, piyasa kapalı"}.get(wstate)
+
+        # Worker'in son hesabini DB'ye yaz — dashboard bunu okur (yeniden hesaplamaz)
+        self.db.set_state({
+            "ts": ts, "btc_price": round(btc_price, 2), "score": score, "regime": regime,
+            "ci": round(ci_val, 1) if ci_val is not None else None, "rsi": round(rsi, 1) if rsi else None,
+            "macro_trend": macro_trend, "gate_reason": gate_reason, "wstate": wstate,
+            "mstr_score": (mstr or {}).get("score"), "mstr_label": (mstr or {}).get("label"),
+            "holdings_advice": adv_map,
+            "flat_reco": ({"reco": "AL", "assets": flat_reco[1]} if flat_reco else
+                          {"reco": "BEKLE", "assets": []}),
+        })
 
         # Anti-spam: tavsiye durumu degismediyse ve eylem yoksa gonderme
         sig = "|".join(sorted(sig_parts))

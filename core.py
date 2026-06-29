@@ -177,6 +177,17 @@ class Database:
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
             conn.commit()
 
+    # --- worker'in son hesap durumu (dashboard bunu okur, yeniden hesaplamaz) ---
+    def set_state(self, state: Dict):
+        self.set_config("LAST_STATE", json.dumps(state))
+
+    def get_state(self) -> Dict:
+        v = self.get_config().get("LAST_STATE")
+        try:
+            return json.loads(v) if v else {}
+        except Exception:
+            return {}
+
     # --- candles ---
     def insert_candles(self, candles: List[Tuple]):
         with self.get_connection() as conn:

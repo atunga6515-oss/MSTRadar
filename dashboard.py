@@ -193,7 +193,7 @@ def _hist(symbol, interval, span, yf_period, yf_interval):
 def mtf_equity(symbol):
     """MSTR/ETF icin 4 zaman dilimi — Robinhood historicals (gercek hacim), yedek yfinance."""
     out = {}
-    h1 = _hist(symbol, "hour", "3month", "60d", "1h")
+    h1 = _hist(symbol, "hour", "month", "60d", "1h")
     d1 = _hist(symbol, "day", "year", "2y", "1d")
     w1 = _hist(symbol, "week", "5year", "5y", "1wk")
     if not h1.empty:
@@ -261,19 +261,23 @@ if top[4].button("🔄 Yenile"):
     st.cache_data.clear()
     st.rerun()
 
-# Kompakt rejim + MSTR teyit satiri (Sinyal v2)
-if not df.empty and len(df) > 30:
-    ci_now = IndicatorCalc.choppiness(df, 14).iloc[-1]
-    adx_now = df['adx'].iloc[-1] if 'adx' in df else None
-    reg = regime_from(float(adx_now) if pd.notna(adx_now) else None,
-                      float(ci_now) if pd.notna(ci_now) else None,
-                      settings.f("ADX_MIN"), settings.f("CHOP_CI_MAX") or 61.8)
+# Worker'in son hesabi (tek doğruluk kaynağı — dashboard yeniden hesaplamaz)
+state = db.get_state()
+import time as _time
+state_age_min = ((int(_time.time() * 1000) - state["ts"]) / 60000) if state.get("ts") else None
+und = settings.s("UNDERLYING") or "MSTR"
+if state:
+    reg = state.get("regime", "—")
     reg_txt = {"TREND": "🟢 TREND (yönlü)", "CHOP": "🔴 CHOP (yatay — yeni pozisyon riskli)",
                "ZAYIF": "🟡 ZAYIF (belirsiz)"}.get(reg, reg)
-    und = settings.s("UNDERLYING") or "MSTR"
-    _, mlabel = confluence(mtf_equity(und))
-    st.caption(f"🧭 **BTC Rejim:** {reg_txt}  ·  **{und} eğilim:** {dir_emoji(mlabel)} {mlabel}  "
-               f"·  Tam sinyal için chop dışı + {und} teyidi gerekir.")
+    msc, mlab = state.get("mstr_score"), state.get("mstr_label") or "veri yok"
+    sc = state.get("score")
+    fresh = f"worker {state_age_min:.0f} dk önce hesapladı" if state_age_min is not None else ""
+    warn = "  ⚠️ **worker eski/durmuş olabilir**" if (state_age_min and state_age_min > 15) else ""
+    st.caption(f"🧭 **BTC Rejim:** {reg_txt}  ·  **Skor:** {sc:+.0f}  ·  **{und} eğilim:** "
+               f"{mlab}{f' ({msc:+.0f})' if msc is not None else ''}  ·  _{fresh}_{warn}")
+else:
+    st.warning("⚠️ Worker henüz hesap yapmadı. `python bot.py` çalışıyor mu? Yeterli mum birikti mi (9600+)?")
 
 tabs = st.tabs(["📊 Grafikler", "🔮 Tahmin / MTF", "🔔 Sinyaller",
                 "💼 Portföyüm", "⚙️ Yonetim"])
@@ -499,21 +503,13 @@ with tabs[3]:
     elif wstate == "WEEKEND":
         st.info("🛡️ Hafta sonu, piyasa kapalı. Elinde pozisyon varsa Pazartesi açılışta/pre-market kapat.")
 
-    # --- Mevcut piyasa durumu (tavsiye uretmek icin) ---
-    score_now, regime_now, rsi_now, mstr_score = None, None, None, None
-    if not df.empty and len(df) > 250:
-        try:
-            df4 = IndicatorCalc.resample_4h(df)
-            last4 = df4.iloc[-1]
-            score_now, _ = SignalScorer.score(df.iloc[-1], df.iloc[-2], last4, last_price, None)
-            rsi_now = float(df['rsi'].iloc[-1])
-            ci_n = IndicatorCalc.choppiness(df, 14).iloc[-1]
-            regime_now = regime_from(float(df['adx'].iloc[-1]), float(ci_n),
-                                     settings.f("ADX_MIN"), settings.f("CHOP_CI_MAX") or 61.8)
-            ms, _ = confluence(mtf_equity(settings.s("UNDERLYING") or "MSTR"))
-            mstr_score = ms
-        except Exception:
-            pass
+    # Tavsiye worker'in son hesabindan gelir (state); yeni eklenen pozisyon icin
+    # ayni girdilerle (state skoru/rejimi) aninda hesaplanir.
+    sadv = state.get("holdings_advice", {}) if state else {}
+    s_score = state.get("score") if state else None
+    s_regime = state.get("regime") if state else None
+    s_rsi = state.get("rsi") if state else None
+    s_mstr = state.get("mstr_score") if state else None
 
     # --- Yeni alım gir ---
     with st.expander("➕ Yeni alım ekle", expanded=False):
@@ -533,29 +529,35 @@ with tabs[3]:
 
     # --- Açık pozisyonlar + bot tavsiyesi ---
     holds = db.get_open_holdings()
+    if state_age_min and state_age_min > 15:
+        st.warning(f"⚠️ Worker {state_age_min:.0f} dk önce hesapladı — tavsiyeler eski olabilir. "
+                   "bot.py çalışıyor mu?")
     if not holds:
-        # el bos -> AL onerisi (hafta sonu durumunda yeni giris yok)
-        if (wstate is None and score_now is not None and regime_now == "TREND"
-                and abs(score_now) >= settings.f("SIGNAL_SCORE_THRESHOLD")):
-            buy = bull if score_now > 0 else bear
-            st.success(f"Elin boş. 🟢 Şu an öneri: **AL {' & '.join(buy)}** "
-                       f"(skor {score_now:+.0f}, {regime_now})")
-        elif wstate:
-            st.info("Elin boş. 🟡 Hafta sonu koruması aktif — **BEKLE** (yeni giriş yok).")
+        fr = state.get("flat_reco", {}) if state else {}
+        if not state:
+            st.warning("Elin boş ve worker henüz hesap yapmadı (yeterli mum birikmemiş olabilir).")
+        elif fr.get("reco") == "AL" and fr.get("assets"):
+            st.success(f"Elin boş. 🟢 Şu an öneri: **AL {' & '.join(fr['assets'])}** "
+                       f"(skor {s_score:+.0f}, {s_regime})")
         else:
-            st.info("Elin boş. 🟡 Şu an net/teyitli sinyal yok — **BEKLE**.")
+            gr = state.get("gate_reason")
+            st.info(f"Elin boş. 🟡 Net/teyitli sinyal yok — **BEKLE**" + (f" ({gr})" if gr else "."))
     else:
         st.markdown("**Açık pozisyonların + bot tavsiyesi:**")
         for h in holds:
             asset, kind, qty = h["asset"], h["kind"], h["qty"]
             live = live_now.get(asset)
-            advice, reason, frac = ("—", "veri yok", None)
-            if wk_ovr:  # hafta sonu koruması her şeyin önünde
+            sa = sadv.get(asset)
+            if wk_ovr:                       # hafta sonu koruması her şeyin önünde
                 advice, reason, frac = wk_ovr
-            elif score_now is not None:
-                mstr_ok = None if mstr_score is None else ((mstr_score > 0) == (kind == "BULL"))
-                advice, reason, frac = holding_advice(kind, score_now, regime_now, mstr_ok,
-                                                      rsi_now, live, h["entry_price"], settings)
+            elif sa:                         # worker'in hesapladığı tavsiye
+                advice, reason, frac = sa.get("advice", "—"), sa.get("reason", ""), sa.get("frac")
+            elif s_score is not None:        # yeni pozisyon: state girdileriyle anında hesapla
+                mstr_ok = None if s_mstr is None else ((s_mstr > 0) == (kind == "BULL"))
+                advice, reason, frac = holding_advice(kind, s_score, s_regime, mstr_ok,
+                                                      s_rsi, live, h["entry_price"], settings)
+            else:
+                advice, reason, frac = "—", "worker hesabı bekleniyor (≤5 dk)", None
             pl = ((live - h["entry_price"]) / h["entry_price"] * 100) if (live and h["entry_price"]) else None
             badge = {"EKLE": "🟢 EKLE", "TUT": "🟡 TUT", "PARCALI_SAT": "🟠 PARÇALI SAT",
                      "SAT": "🔴 SAT", "—": "⚪ —"}[advice]
