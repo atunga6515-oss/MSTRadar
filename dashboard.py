@@ -321,36 +321,37 @@ with tabs[0]:
         fig.update_layout(height=620, xaxis_rangeslider_visible=False, margin=dict(t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    # MSTR + ETF grafikleri (yfinance)
+    # MSTR + ETF: fiyat ROBINHOOD'dan (üst panelle tutarlı), 5g mini grafik trend için yfinance
     st.subheader("MSTR & ETF'ler (baz riski takibi)")
-    if not HAS_YF:
-        st.info("yfinance kurulu degil: `pip install yfinance`")
-    else:
-        underlying = settings.s("UNDERLYING") or "MSTR"
-        syms = [underlying] + settings.list("ASSETS_BULL") + settings.list("ASSETS_BEAR")
-        data = load_yf(syms)
-        cols = st.columns(min(len(syms), 4) or 1)
-        for i, s in enumerate(syms):
-            with cols[i % len(cols)]:
-                if s in data:
-                    d = data[s]
-                    chg = (d['Close'].iloc[-1] / d['Close'].iloc[0] - 1) * 100
-                    st.metric(s, f"${d['Close'].iloc[-1]:.2f}", f"{chg:+.1f}% (5g)")
-                    st.line_chart(d['Close'], height=140)
-                else:
-                    st.metric(s, "veri yok")
-        # BTC-MSTR korelasyonu (baz riski göstergesi)
-        if underlying in data and not df.empty:
-            try:
-                m = data[underlying]['Close'].pct_change().dropna()
-                b = df.set_index('timestamp_dt')['close'].resample('15min').last().pct_change().dropna()
-                j = pd.concat([m.tz_convert('UTC'), b], axis=1).dropna()
-                if len(j) > 10:
-                    corr = j.iloc[:, 0].corr(j.iloc[:, 1])
-                    st.caption(f"BTC ↔ {underlying} 15dk getiri korelasyonu (5g): **{corr:.2f}** "
-                               f"— 1'e yakin = ETF sinyali BTC ile uyumlu; dusukse baz riski yuksek.")
-            except Exception:
-                pass
+    underlying = settings.s("UNDERLYING") or "MSTR"
+    syms = [underlying] + settings.list("ASSETS_BULL") + settings.list("ASSETS_BEAR")
+    data = load_yf(syms) if HAS_YF else {}
+    cols = st.columns(min(len(syms), 4) or 1)
+    for i, s in enumerate(syms):
+        with cols[i % len(cols)]:
+            q = rhq.get(s, {})
+            price, pc = q.get("price"), q.get("prev_close")
+            if price:
+                chg = f"{(price/pc-1)*100:+.1f}% (gün)" if pc else None
+                st.metric(s, f"${price:.2f}", chg)   # Robinhood (üst panelle aynı)
+            elif s in data and not data[s].empty:
+                st.metric(s, f"${data[s]['Close'].iloc[-1]:.2f}", "yfinance")
+            else:
+                st.metric(s, "veri yok")
+            if s in data and not data[s].empty:
+                st.line_chart(data[s]['Close'], height=140)
+    # BTC-MSTR korelasyonu (baz riski göstergesi)
+    if underlying in data and not df.empty:
+        try:
+            m = data[underlying]['Close'].pct_change().dropna()
+            b = df.set_index('timestamp_dt')['close'].resample('15min').last().pct_change().dropna()
+            j = pd.concat([m.tz_convert('UTC'), b], axis=1).dropna()
+            if len(j) > 10:
+                corr = j.iloc[:, 0].corr(j.iloc[:, 1])
+                st.caption(f"BTC ↔ {underlying} 15dk getiri korelasyonu (5g): **{corr:.2f}** "
+                           f"— 1'e yakin = ETF sinyali BTC ile uyumlu; dusukse baz riski yuksek.")
+        except Exception:
+            pass
 
 # ===========================================================================
 # TAB 1b — Tahmin / Coklu Zaman Dilimi (MTF)
