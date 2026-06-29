@@ -21,6 +21,7 @@ from core import (
     f_or_none, us_market_status, is_tradeable, alpaca_latest_prices,
     normalize_ohlc, mtf_score, regime_from, holding_advice,
     weekend_state, weekend_override,
+    alpaca_snapshot, leverage_map, synthetic_etf_prices,
 )
 
 # ---------------------------------------------------------------------------
@@ -111,23 +112,49 @@ class DataFetcher:
         if total:
             logger.info(f"Updated {total} new candles.")
 
+    def _yf_last(self, symbol, prepost=False) -> Optional[float]:
+        try:
+            d = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=prepost)
+            if not d.empty:
+                return float(d['Close'].iloc[-1])
+            d = yf.Ticker(symbol).history(period="1d")
+            return float(d['Close'].iloc[-1]) if not d.empty else None
+        except Exception:
+            return None
+
+    def _yf_prev_close(self, symbol) -> Optional[float]:
+        try:
+            d = yf.Ticker(symbol).history(period="5d", interval="1d")
+            return float(d['Close'].iloc[-2]) if len(d) >= 2 else None
+        except Exception:
+            return None
+
     def fetch_etf_prices(self) -> Dict[str, float]:
         assets = self.settings.list("ASSETS_BULL") + self.settings.list("ASSETS_BEAR")
-        # 1) Once Alpaca (varsa ~gercek zamanli IEX); 2) eksikleri yfinance (~15dk gecikmeli)
-        prices: Dict[str, float] = alpaca_latest_prices(assets)
-        if prices:
-            logger.info(f"ETF fiyatlari Alpaca'dan alindi: {list(prices.keys())}")
-        missing = [a for a in assets if a not in prices]
-        for asset in missing:
-            for attempt in range(3):
-                try:
-                    data = yf.Ticker(asset).history(period="1d")
-                    if not data.empty:
-                        prices[asset] = float(data['Close'].iloc[-1])
-                    break
-                except Exception as e:
-                    logger.error(f"Attempt {attempt + 1}: Error fetching {asset}: {e}")
-                    time.sleep(2 ** attempt)
+        prices: Dict[str, float] = {}
+
+        # 1) MSTR-SENTETIK (oncelikli): ETF'i likit MSTR'dan turet — ince/donmus feed sorununu asar
+        if self.settings.b("USE_SYNTHETIC_PRICE"):
+            und = self.settings.s("UNDERLYING") or "MSTR"
+            snap = alpaca_snapshot([und] + assets)
+            mstr_price = snap.get(und, {}).get("price") or self._yf_last(und, prepost=True)
+            mstr_pc = snap.get(und, {}).get("prev_close") or self._yf_prev_close(und)
+            etf_pc = {}
+            for a in assets:
+                etf_pc[a] = snap.get(a, {}).get("prev_close") or self._yf_prev_close(a)
+            prices = synthetic_etf_prices(mstr_price, mstr_pc, etf_pc, leverage_map(self.settings))
+            if prices:
+                logger.info(f"ETF fiyatlari MSTR-sentetik (MSTR={mstr_price}): "
+                            f"{ {k: round(v,2) for k,v in prices.items()} }")
+
+        # 2) Eksikleri Alpaca dogrudan (gercek zamanli IEX)
+        for a, p in alpaca_latest_prices([x for x in assets if x not in prices]).items():
+            prices[a] = p
+        # 3) Hala eksikse yfinance
+        for a in [x for x in assets if x not in prices]:
+            v = self._yf_last(a)
+            if v:
+                prices[a] = v
         return prices
 
     def fetch_underlying_score(self) -> Optional[Dict]:

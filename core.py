@@ -62,6 +62,10 @@ ENV_DEFAULTS = {
     "HOLDING_STOP_PCT": os.getenv("HOLDING_STOP_PCT", "15"),   # ETF girise gore bu kadar dustuyse SAT
     "PARTIAL_SELL_PCT": os.getenv("PARTIAL_SELL_PCT", "33"),   # PARCALI SAT'ta onerilen oran (%)
     "STOP_BUFFER_PCT": os.getenv("STOP_BUFFER_PCT", "1.5"),    # feed gurultusu icin stop toleransi
+    # --- MSTR-sentetik ETF fiyati (ince/donmus ETF feed'i yerine MSTR'dan turet) ---
+    "USE_SYNTHETIC_PRICE": os.getenv("USE_SYNTHETIC_PRICE", "true"),
+    "BULL_LEVERAGE": os.getenv("BULL_LEVERAGE", "2"),    # MSTU/MSTX = +2x MSTR
+    "BEAR_LEVERAGE": os.getenv("BEAR_LEVERAGE", "-2"),   # MSTZ = -2x MSTR
     # --- Hafta sonu koruması (kaldiracli ETF gap riski) ---
     "WEEKEND_FLAT": os.getenv("WEEKEND_FLAT", "true"),        # Cuma kapanisa yakin pozisyonlari kapat
     "WEEKEND_FLAT_MIN": os.getenv("WEEKEND_FLAT_MIN", "20"),  # Cuma kapanistan kac dk once SAT uyarisi
@@ -651,6 +655,61 @@ def alpaca_quotes(symbols) -> Dict[str, Dict]:
 def alpaca_latest_prices(symbols) -> Dict[str, float]:
     """Sadece fiyat dict'i (geriye uyumluluk icin)."""
     return {s: q["price"] for s, q in alpaca_quotes(symbols).items() if q.get("price")}
+
+
+def alpaca_snapshot(symbols) -> Dict[str, Dict]:
+    """Her sembol icin {price, prev_close, ts} — sentetik hesap icin onceki kapanis dahil."""
+    key = os.getenv("ALPACA_API_KEY", "")
+    secret = os.getenv("ALPACA_API_SECRET", "")
+    if not key or not secret or not symbols:
+        return {}
+    feed = os.getenv("ALPACA_FEED", "iex")
+    try:
+        import requests
+        resp = requests.get("https://data.alpaca.markets/v2/stocks/snapshots",
+                            params={"symbols": ",".join(symbols), "feed": feed},
+                            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+                            timeout=10)
+        resp.raise_for_status()
+        out: Dict[str, Dict] = {}
+        for sym, snap in resp.json().items():
+            if not isinstance(snap, dict):
+                continue
+            trade = snap.get("latestTrade") or {}
+            prev = snap.get("prevDailyBar") or {}
+            out[sym] = {
+                "price": float(trade["p"]) if trade.get("p") else None,
+                "prev_close": float(prev["c"]) if prev.get("c") else None,
+                "ts": trade.get("t"),
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def leverage_map(settings) -> Dict[str, float]:
+    """Varlik -> kaldirac (MSTU/MSTX=+2, MSTZ=-2). Panelden ayarlanabilir."""
+    bl = settings.f("BULL_LEVERAGE") or 2.0
+    br = settings.f("BEAR_LEVERAGE") or -2.0
+    m = {a: bl for a in settings.list("ASSETS_BULL")}
+    m.update({a: br for a in settings.list("ASSETS_BEAR")})
+    return m
+
+
+def synthetic_etf_prices(mstr_price, mstr_prev_close, etf_prev_closes: Dict[str, float],
+                         leverages: Dict[str, float]) -> Dict[str, float]:
+    """Kaldiracli ETF'i likit MSTR'dan turet:
+       ETF = ETF_onceki_kapanis * (1 + kaldirac * MSTR_gunluk_getirisi).
+    MSTR'in (after-hours dahil) anlik fiyatiyla beslenirse Midas'i yakindan takip eder."""
+    out: Dict[str, float] = {}
+    if not mstr_price or not mstr_prev_close:
+        return out
+    ret = mstr_price / mstr_prev_close - 1
+    for sym, pc in etf_prev_closes.items():
+        lev = leverages.get(sym)
+        if pc and lev is not None:
+            out[sym] = round(pc * (1 + lev * ret), 4)
+    return out
 
 
 def f_or_none(x):

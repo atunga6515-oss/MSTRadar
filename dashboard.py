@@ -18,7 +18,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core import (Database, Settings, IndicatorCalc, SignalScorer, us_market_status, csv_list,
-                  alpaca_latest_prices, alpaca_quotes, fetch_klines, normalize_ohlc, mtf_score,
+                  alpaca_latest_prices, alpaca_quotes, alpaca_snapshot, leverage_map,
+                  synthetic_etf_prices, fetch_klines, normalize_ohlc, mtf_score,
                   forecast_cone, empirical_up_probability, regime_from, holding_advice,
                   weekend_state, weekend_override)
 
@@ -69,10 +70,42 @@ def live_prices(symbols):
     return px
 
 
+def _yf_price(sym, prepost=True):
+    try:
+        d = yf.Ticker(sym).history(period="1d", interval="1m", prepost=prepost)
+        return float(d['Close'].iloc[-1]) if not d.empty else None
+    except Exception:
+        return None
+
+
+def _yf_prevclose(sym):
+    try:
+        d = yf.Ticker(sym).history(period="5d", interval="1d")
+        return float(d['Close'].iloc[-2]) if len(d) >= 2 else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=30)
 def etf_quotes(symbols):
-    """Her sembol icin {price, bid, ask, ts, source}. Once Alpaca, eksigi yfinance."""
-    q = dict(alpaca_quotes(list(symbols)))
+    """Her sembol icin {price, bid, ask, ts, source}.
+    Oncelik: MSTR-sentetik (likit MSTR'dan) -> Alpaca -> yfinance."""
+    symbols = list(symbols)
+    q = {}
+    # 1) MSTR-sentetik
+    if settings.b("USE_SYNTHETIC_PRICE"):
+        und = settings.s("UNDERLYING") or "MSTR"
+        snap = alpaca_snapshot([und] + symbols)
+        mstr_price = snap.get(und, {}).get("price") or _yf_price(und)
+        mstr_pc = snap.get(und, {}).get("prev_close") or _yf_prevclose(und)
+        etf_pc = {s: (snap.get(s, {}).get("prev_close") or _yf_prevclose(s)) for s in symbols}
+        synth = synthetic_etf_prices(mstr_price, mstr_pc, etf_pc, leverage_map(settings))
+        src = f"MSTR-sentetik (MSTR=${mstr_price:.2f})" if mstr_price else "MSTR-sentetik"
+        for s, p in synth.items():
+            q[s] = {"price": p, "bid": None, "ask": None, "ts": None, "source": src}
+    # 2) Eksikleri Alpaca
+    q.update(alpaca_quotes([s for s in symbols if s not in q]))
+    # 3) Hala eksikse yfinance
     missing = [s for s in symbols if s not in q]
     if missing:
         d = load_yf(missing, period="1d", interval="5m")
@@ -525,6 +558,7 @@ with tabs[4]:
                 "MARKET_HOURS_ONLY", "USE_FUTURES_SENTIMENT",
                 "USE_MSTR_CONFIRM", "CHOP_FILTER", "CHOP_CI_MAX",
                 "HOLDING_STOP_PCT", "PARTIAL_SELL_PCT", "STOP_BUFFER_PCT",
+                "USE_SYNTHETIC_PRICE", "BULL_LEVERAGE", "BEAR_LEVERAGE",
                 "WEEKEND_FLAT", "WEEKEND_FLAT_MIN", "WEEKEND_NOENTRY_MIN",
                 "ASSETS_BULL", "ASSETS_BEAR", "UNDERLYING"]
     with st.form("config_form"):
